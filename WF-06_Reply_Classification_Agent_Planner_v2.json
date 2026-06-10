@@ -1,0 +1,1289 @@
+{
+  "name": "WF-06 Reply Classification + Agent Planner",
+  "nodes": [
+    {
+      "id": "wf06-node-001",
+      "name": "Webhook Reply Received",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "path": "reply-received",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-002",
+      "name": "Verify Token",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const headers = $input.first().json.headers || {};\nconst token   = headers['x-internal-token'] || headers['X-Internal-Token'];\n\nif (!token || token !== $env.INTERNAL_WEBHOOK_SECRET) {\n  throw new Error('UNAUTHORIZED_REQUEST: invalid or missing token');\n}\n\nreturn [{ json: $input.first().json }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-003",
+      "name": "Extract Reply Data",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// ── Extract and normalise reply data from Gmail webhook payload ────\n// Gmail push notifications arrive via Pub/Sub with base64-encoded data.\n// This node handles both direct webhook payloads and Pub/Sub format.\n\nconst body = $input.first().json.body || $input.first().json;\n\n// Handle Gmail Pub/Sub base64 payload\nlet gmailData = body;\nif (body.message?.data) {\n  try {\n    const decoded = Buffer.from(body.message.data, 'base64').toString('utf-8');\n    gmailData = JSON.parse(decoded);\n  } catch(e) {\n    // Not base64 encoded — use as-is\n  }\n}\n\n// Extract core fields — handle both Gmail API format and simplified webhook\nconst threadId  = gmailData.threadId  || gmailData.thread_id  || body.threadId  || null;\nconst messageId = gmailData.messageId || gmailData.message_id || body.messageId || null;\nconst fromEmail = (gmailData.from || gmailData.sender || body.from || '').toLowerCase().trim();\nconst toEmail   = (gmailData.to   || body.to   || '').toLowerCase().trim();\nconst subject   = gmailData.subject || body.subject || '';\nconst bodyText  = gmailData.bodyText || gmailData.body_text || gmailData.snippet || body.body || '';\nconst receivedAt = gmailData.receivedAt || body.received_at || new Date().toISOString();\n\nif (!threadId && !fromEmail) {\n  throw new Error('REPLY_PARSE_FAILED: cannot identify thread or sender');\n}\n\n// Strip quoted text — keep only the new reply content\nconst cleanBody = bodyText\n  .split(/\\n>|\\nOn .+ wrote:|\\n--+\\s*Original Message/i)[0]\n  .trim()\n  .slice(0, 5000);  // cap to prevent oversized payloads\n\nreturn [{\n  json: {\n    thread_id:   threadId,\n    message_id:  messageId,\n    from_email:  fromEmail,\n    to_email:    toEmail,\n    subject,\n    body_text:   cleanBody,\n    raw_body:    bodyText.slice(0, 2000),\n    received_at: receivedAt\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-004",
+      "name": "Match Lead by Thread ID",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        920,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  l.id              AS lead_id,\n  l.email,\n  l.first_name,\n  l.full_name,\n  l.company,\n  l.icp_tier        AS tier,\n  l.status          AS lead_status,\n  ss.id             AS step_id,\n  ss.sequence_id,\n  ss.step_number,\n  ss.step_type,\n  ss.subject        AS original_subject,\n  ss.body_text      AS original_body,\n  ss.strategy_used,\n  ss.subject_variant,\n  ss.gmail_thread_id,\n  ss.sent_at,\n  lb.brief\nFROM sequence_steps ss\nJOIN sequences s  ON s.id  = ss.sequence_id\nJOIN leads     l  ON l.id  = s.lead_id\nLEFT JOIN lead_briefs lb ON lb.lead_id = l.id\nWHERE ss.gmail_thread_id = $1\n  AND ss.status = 'sent'\nORDER BY ss.sent_at DESC\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.thread_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-005",
+      "name": "Fallback: Match by Email",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        920,
+        480
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  l.id              AS lead_id,\n  l.email,\n  l.first_name,\n  l.full_name,\n  l.company,\n  l.icp_tier        AS tier,\n  l.status          AS lead_status,\n  ss.id             AS step_id,\n  ss.sequence_id,\n  ss.step_number,\n  ss.step_type,\n  ss.subject        AS original_subject,\n  ss.body_text      AS original_body,\n  ss.strategy_used,\n  ss.subject_variant,\n  ss.gmail_thread_id,\n  ss.sent_at,\n  lb.brief\nFROM sequence_steps ss\nJOIN sequences s  ON s.id  = ss.sequence_id\nJOIN leads     l  ON l.id  = s.lead_id\nLEFT JOIN lead_briefs lb ON lb.lead_id = l.id\nWHERE l.email = $1\n  AND ss.status = 'sent'\nORDER BY ss.sent_at DESC\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.from_email ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-006",
+      "name": "Merge Lead Match",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1160,
+        380
+      ],
+      "parameters": {
+        "functionCode": "// ── Merge thread-match and email-match results ─────────────────────\n// Use thread match if available; fall back to email match.\n// If neither found, throw — we can't process an unmatched reply.\n\nconst replyData  = $items('Extract Reply Data')[0].json;\nconst threadMatch = $items('Match Lead by Thread ID');\nconst emailMatch  = $items('Fallback: Match by Email');\n\nconst match =\n  (threadMatch.length > 0 && threadMatch[0].json.lead_id ? threadMatch[0].json : null) ||\n  (emailMatch.length  > 0 && emailMatch[0].json.lead_id  ? emailMatch[0].json  : null);\n\nif (!match || !match.lead_id) {\n  throw new Error(`UNMATCHED_REPLY: no lead found for thread ${replyData.thread_id} / email ${replyData.from_email}`);\n}\n\n// Parse brief if string\nconst parseCol = (v) => {\n  if (!v) return {};\n  if (typeof v === 'object') return v;\n  try { return JSON.parse(v); } catch(e) { return {}; }\n};\n\nreturn [{\n  json: {\n    ...replyData,\n    ...match,\n    brief:      parseCol(match.brief),\n    match_type: threadMatch.length > 0 && threadMatch[0].json.lead_id ? 'thread' : 'email'\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-008",
+      "name": "Load Conversation History",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  c.id,\n  c.direction,\n  c.body_text,\n  c.subject,\n  c.sent_at,\n  c.intent,\n  c.sentiment\nFROM conversations c\nWHERE c.lead_id = $1\nORDER BY c.sent_at ASC\nLIMIT 20;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-009",
+      "name": "Check Memory Summary",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1640,
+        300
+      ],
+      "parameters": {
+        "operation": "get",
+        "key": "={{ `memory:lead:${$json.lead_id}` }}"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-010",
+      "name": "Build Conversation Context",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1880,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// ── Build conversation context for classification ──────────────────\n// Combines Redis memory summary (if cached) with recent conversation\n// turns. Caps total context to prevent token explosion.\n\nconst merged     = $items('Merge Lead Match')[0].json;\nconst history    = $items('Load Conversation History').map(i => i.json);\nconst memoryCached = $items('Check Memory Summary')[0].json.value || null;\n\nlet memoryParsed = null;\nif (memoryCached) {\n  try { memoryParsed = JSON.parse(memoryCached); } catch(e) {}\n}\n\n// Format conversation turns for prompt\nconst safe = (t, max = 500) => String(t || '').slice(0, max);\n\nconst historyLines = history.map(h =>\n  `[${h.direction === 'outbound' ? 'US' : 'LEAD'} @ ${(h.sent_at || '').slice(0,10)}]: ${safe(h.body_text, 300)}`\n).join('\\n');\n\n// Append the new reply as the latest turn\nconst fullContext =\n  (memoryParsed?.summary ? `PRIOR SUMMARY: ${memoryParsed.summary}\\n\\n` : '') +\n  (historyLines ? `CONVERSATION HISTORY:\\n${historyLines}\\n\\n` : '') +\n  `LATEST REPLY FROM LEAD:\\n${safe(merged.body_text, 1000)}`;\n\nreturn [{\n  json: {\n    ...merged,\n    conversation_history: history,\n    conversation_context: fullContext.slice(0, 4000),  // hard cap\n    has_memory_cache:     !!memoryParsed,\n    memory_summary:       memoryParsed?.summary || null,\n    turn_count:           history.length\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-011",
+      "name": "Classify Intent via OpenAI",
+      "type": "n8n-nodes-base.openAi",
+      "position": [
+        2120,
+        300
+      ],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert B2B sales reply classifier. Analyse a reply to a cold email and classify the sender's intent with high accuracy. Output ONLY valid JSON — no markdown, no preamble."
+            },
+            {
+              "role": "user",
+              "content": "={{ `Classify this reply and return a JSON object with exactly these keys:\n{\n  \"intent\": \"one of: INTERESTED | NOT_INTERESTED | REFERRAL | AUTO_REPLY | WRONG_PERSON | OBJECTION | QUESTION | UNSUBSCRIBE | MEETING_REQUEST | NEUTRAL\",\n  \"sentiment\": \"POSITIVE | NEGATIVE | NEUTRAL\",\n  \"confidence\": 0.0-1.0,\n  \"confidence_reason\": \"one sentence\",\n  \"key_signals\": [\"up to 3 phrases or signals that drove this classification\"],\n  \"objection_type\": \"if OBJECTION: one of: pricing | timing | no_need | competitor | budget | authority | null\",\n  \"referral_name\": \"if REFERRAL: the name or role they referred to, else null\",\n  \"urgency\": \"HIGH | MEDIUM | LOW\",\n  \"summary\": \"one sentence summary of what the lead said\"\n}\n\nLEAD PROFILE:\nName: ${$json.first_name || $json.full_name}\nCompany: ${$json.company}\nTier: ${$json.tier}\nOriginal email subject: ${$json.original_subject}\nStep number in sequence: ${$json.step_number}\n\nCONVERSATION CONTEXT:\n${$json.conversation_context}` }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.2,
+          "maxTokens": 500
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-main",
+          "name": "AZOX OpenAI"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-012",
+      "name": "Parse Intent",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2360,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// ── Parse intent classification response ──────────────────────────\nconst raw = $input.first().json?.choices?.[0]?.message?.content\n         || $input.first().json?.message?.content || '';\n\nlet intent = {};\ntry {\n  const start = raw.indexOf('{');\n  const end   = raw.lastIndexOf('}');\n  if (start === -1 || end === -1) throw new Error('no JSON found');\n  intent = JSON.parse(raw.slice(start, end + 1));\n} catch(e) {\n  // Fallback classification on parse failure\n  intent = {\n    intent:           'NEUTRAL',\n    sentiment:        'NEUTRAL',\n    confidence:       0.3,\n    confidence_reason: 'parse failed — manual review needed',\n    key_signals:      [],\n    objection_type:   null,\n    referral_name:    null,\n    urgency:          'LOW',\n    summary:          raw.slice(0, 200)\n  };\n}\n\nconst ctx = $items('Build Conversation Context')[0].json;\n\nreturn [{\n  json: {\n    ...ctx,\n    intent:           intent.intent           || 'NEUTRAL',\n    sentiment:        intent.sentiment         || 'NEUTRAL',\n    intent_confidence: parseFloat(intent.confidence) || 0.5,\n    confidence_reason: intent.confidence_reason || '',\n    key_signals:      intent.key_signals       || [],\n    objection_type:   intent.objection_type    || null,\n    referral_name:    intent.referral_name     || null,\n    urgency:          intent.urgency           || 'LOW',\n    reply_summary:    intent.summary           || '',\n    classified_at:    new Date().toISOString()\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-013",
+      "name": "Save Reply to Conversations",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2600,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO conversations (\n  lead_id, sequence_id, step_id,\n  direction, subject, body_text,\n  gmail_thread_id, gmail_message_id,\n  intent, sentiment, intent_confidence,\n  key_signals, reply_summary,\n  sent_at, created_at\n) VALUES (\n  $1, $2, $3,\n  'inbound', $4, $5,\n  $6, $7,\n  $8, $9, $10,\n  $11::jsonb, $12,\n  $13::timestamptz, NOW()\n)\nRETURNING id AS conversation_id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  $json.sequence_id,\n  $json.step_id,\n  $json.subject,\n  $json.body_text,\n  $json.thread_id,\n  $json.message_id,\n  $json.intent,\n  $json.sentiment,\n  $json.intent_confidence,\n  JSON.stringify($json.key_signals),\n  $json.reply_summary,\n  $json.received_at\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-014",
+      "name": "Update Memory Summary",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2840,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// ── Update Redis memory summary ────────────────────────────────────\n// Builds a rolling summary of the conversation state.\n// Stored at memory:lead:{lead_id} with 30-day TTL.\n// This is the agent's working memory — avoids re-reading full history.\n\nconst d = $input.first().json;\n\nconst existing = d.memory_summary || '';\n\nconst newEntry =\n  `[${new Date().toISOString().slice(0,10)}] ` +\n  `Step ${d.step_number} reply — Intent: ${d.intent} (${Math.round(d.intent_confidence * 100)}%) ` +\n  `| Sentiment: ${d.sentiment} | Urgency: ${d.urgency}\\n` +\n  `Summary: ${d.reply_summary}`;\n\n// Keep last 3 entries in memory (rolling window)\nconst entries = [\n  ...existing.split('\\n---\\n').filter(Boolean),\n  newEntry\n].slice(-3);\n\nconst updatedSummary = entries.join('\\n---\\n');\n\nconst memoryPayload = JSON.stringify({\n  lead_id:        d.lead_id,\n  summary:        updatedSummary,\n  last_intent:    d.intent,\n  last_sentiment: d.sentiment,\n  turn_count:     d.turn_count + 1,\n  updated_at:     new Date().toISOString()\n});\n\nreturn [{\n  json: {\n    ...d,\n    updated_memory:  updatedSummary,\n    memory_payload:  memoryPayload,\n    memory_key:      `memory:lead:${d.lead_id}`\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-015",
+      "name": "Write Memory to Redis",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        3080,
+        300
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ $json.memory_key }}",
+        "value": "={{ $json.memory_payload }}",
+        "expire": true,
+        "ttl": 2592000
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-016",
+      "name": "Agent Planner",
+      "type": "n8n-nodes-base.openAi",
+      "position": [
+        3320,
+        300
+      ],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an autonomous B2B sales agent. Based on a lead's reply intent, conversation history, and profile, decide the single best next action. Be decisive. Output ONLY valid JSON — no markdown, no preamble."
+            },
+            {
+              "role": "user",
+              "content": "={{ `Decide the best next action for this lead. Return a JSON object with exactly these keys:\n{\n  \"action\": \"one of: reply_to_lead | propose_meeting | schedule_followup | pause_sequence | escalate_to_human | close_unsubscribe | update_contact\",\n  \"reason\": \"one sentence explaining why this action was chosen\",\n  \"confidence\": 0.0-1.0,\n  \"urgency\": \"HIGH | MEDIUM | LOW\",\n  \"reply_draft\": \"if action is reply_to_lead: a draft reply (plain text, max 120 words), else null\",\n  \"followup_delay_days\": \"if action is schedule_followup: number of days, else null\",\n  \"meeting_context\": \"if action is propose_meeting: one sentence about why now is the right time, else null\",\n  \"escalation_reason\": \"if action is escalate_to_human: specific reason requiring human judgment, else null\"\n}\n\nLEAD:\nName: ${$json.first_name || $json.full_name} | Company: ${$json.company} | Tier: ${$json.tier}\n\nCLASSIFIED INTENT: ${$json.intent}\nSENTIMENT: ${$json.sentiment} | URGENCY: ${$json.urgency}\nKEY SIGNALS: ${($json.key_signals || []).join(', ')}\nOBJECTION TYPE: ${$json.objection_type || 'none'}\n\nREPLY SUMMARY: ${$json.reply_summary}\n\nCONVERSATION MEMORY:\\n${$json.updated_memory}\n\nLEAD BRIEF CONTEXT:\nPain points: ${($json.brief?.pain_points || []).slice(0,2).join('; ')}\nRecommended approach: ${$json.brief?.recommended_approach || 'consultative'}\n\nACTION GUIDANCE:\n- INTERESTED or MEETING_REQUEST → propose_meeting\n- QUESTION → reply_to_lead (answer it helpfully)\n- OBJECTION → reply_to_lead (address objection, do not push hard)\n- REFERRAL → update_contact + reply_to_lead asking to intro\n- NOT_INTERESTED → pause_sequence\n- UNSUBSCRIBE → close_unsubscribe\n- AUTO_REPLY or WRONG_PERSON → schedule_followup (7 days)\n- Low confidence OR complex situation → escalate_to_human\n- NEUTRAL with Tier A → escalate_to_human (too valuable to risk)` }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 600
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-main",
+          "name": "AZOX OpenAI"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-017",
+      "name": "Parse Planner Decision",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        3560,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// ── Parse Agent Planner decision ──────────────────────────────────\nconst raw = $input.first().json?.choices?.[0]?.message?.content\n         || $input.first().json?.message?.content || '';\n\nlet decision = {};\ntry {\n  const start = raw.indexOf('{');\n  const end   = raw.lastIndexOf('}');\n  if (start === -1 || end === -1) throw new Error('no JSON');\n  decision = JSON.parse(raw.slice(start, end + 1));\n} catch(e) {\n  // Always escalate on parse failure — never silently drop a reply\n  decision = {\n    action:            'escalate_to_human',\n    reason:            'planner parse failed — needs manual review',\n    confidence:        0.0,\n    urgency:           'HIGH',\n    reply_draft:       null,\n    escalation_reason: `Parse error: ${e.message}`\n  };\n}\n\n// Force escalation on low confidence\nconst confidence = parseFloat(decision.confidence) || 0;\nif (confidence < 0.6 && decision.action !== 'escalate_to_human') {\n  decision.escalation_reason = `Low planner confidence: ${confidence}`;\n  decision.action = 'escalate_to_human';\n}\n\nconst ctx = $items('Build Conversation Context')[0].json;\n\nreturn [{\n  json: {\n    ...ctx,\n    action:               decision.action,\n    action_reason:        decision.reason,\n    planner_confidence:   confidence,\n    planner_urgency:      decision.urgency           || 'LOW',\n    reply_draft:          decision.reply_draft        || null,\n    followup_delay_days:  decision.followup_delay_days || null,\n    meeting_context:      decision.meeting_context    || null,\n    escalation_reason:    decision.escalation_reason  || null,\n    decided_at:           new Date().toISOString(),\n    execution_id:         $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-018",
+      "name": "Route Action",
+      "type": "n8n-nodes-base.switch",
+      "position": [
+        3800,
+        300
+      ],
+      "parameters": {
+        "dataPropertyName": "action",
+        "rules": {
+          "rules": [
+            {
+              "value": "reply_to_lead",
+              "output": 0
+            },
+            {
+              "value": "propose_meeting",
+              "output": 1
+            },
+            {
+              "value": "schedule_followup",
+              "output": 2
+            },
+            {
+              "value": "pause_sequence",
+              "output": 3
+            },
+            {
+              "value": "escalate_to_human",
+              "output": 4
+            },
+            {
+              "value": "close_unsubscribe",
+              "output": 5
+            },
+            {
+              "value": "update_contact",
+              "output": 6
+            }
+          ]
+        },
+        "fallbackOutput": 4
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-019",
+      "name": "Guardrail Check Reply",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        4040,
+        60
+      ],
+      "parameters": {
+        "functionCode": "// ── Guardrail check on AI-drafted reply ───────────────────────────\n// Same guardrail logic as WF-04 but lighter — this is a reply,\n// not a cold email, so rules are slightly relaxed.\n\nconst { reply_draft, first_name, company } = $input.first().json;\n\nif (!reply_draft || reply_draft.trim().length < 10) {\n  throw new Error('GUARDRAIL_FAIL: reply_draft is empty or too short');\n}\n\nconst body = reply_draft.toLowerCase();\nconst violations = [];\n\n// Placeholder leakage\nif (/\\[.*?\\]|\\{.*?\\}|\\bUNKNOWN\\b/i.test(reply_draft)) {\n  violations.push('placeholder_leakage');\n}\n\n// Legal risk\nif (/guaranteed roi|we promise|100% results/i.test(body)) {\n  violations.push('legal_risk');\n}\n\n// Too long for a reply (>200 words)\nconst wordCount = reply_draft.trim().split(/\\s+/).length;\nif (wordCount > 200) {\n  violations.push(`reply_too_long: ${wordCount} words`);\n}\n\n// Competitor mentions\nconst competitors = ($env.COMPETITOR_NAMES || '').split(',').filter(Boolean);\nif (competitors.some(c => body.includes(c.toLowerCase().trim()))) {\n  violations.push('competitor_mention');\n}\n\nconst passed = violations.length === 0;\n\nreturn [{\n  json: {\n    ...$input.first().json,\n    guardrail_passed:     passed,\n    guardrail_violations: violations,\n    reply_word_count:     wordCount\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-020",
+      "name": "Reply Guardrail OK?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        4280,
+        60
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.guardrail_passed }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-021",
+      "name": "Send Reply via Gmail",
+      "type": "n8n-nodes-base.gmail",
+      "position": [
+        4520,
+        0
+      ],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $json.from_email }}",
+        "subject": "={{ `Re: ${$json.original_subject}` }}",
+        "emailType": "text",
+        "message": "={{ $json.reply_draft }}",
+        "options": {
+          "replyTo": "={{ $env.SENDER_EMAIL }}",
+          "appendAttribution": false,
+          "threadId": "={{ $json.thread_id }}"
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-main",
+          "name": "AZOX Gmail"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-022",
+      "name": "Log Reply Sent",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4760,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO conversations (\n  lead_id, sequence_id, step_id,\n  direction, subject, body_text,\n  gmail_thread_id, intent,\n  sent_at, created_at\n) VALUES (\n  $1, $2, $3,\n  'outbound', $4, $5,\n  $6, 'reply_sent',\n  NOW(), NOW()\n);",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  $json.sequence_id,\n  $json.step_id,\n  $json.subject,\n  $json.reply_draft,\n  $json.thread_id\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-023",
+      "name": "Trigger WF-07 Meeting",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        4040,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_BASE_URL }}/webhook/meeting-booking",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Internal-Token",
+              "value": "={{ $env.INTERNAL_WEBHOOK_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "lead_id",
+              "value": "={{ $json.lead_id }}"
+            },
+            {
+              "name": "meeting_context",
+              "value": "={{ $json.meeting_context }}"
+            },
+            {
+              "name": "urgency",
+              "value": "={{ $json.planner_urgency }}"
+            },
+            {
+              "name": "event",
+              "value": "intent.interested"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000,
+          "ignoreResponseCode": true
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-024",
+      "name": "Schedule Follow-up Step",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4040,
+        340
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sequence_steps (\n  sequence_id, step_number, step_type,\n  subject, body_text, preview_text,\n  scheduled_at, status,\n  strategy_used, created_at\n) SELECT\n  s.id,\n  COALESCE(MAX(ss.step_number), 0) + 1,\n  'follow_up',\n  'Following up — ' || l.company,\n  'Scheduled follow-up after auto-reply or neutral response.',\n  'Following up soon',\n  NOW() + ($2 || ' days')::INTERVAL,\n  'scheduled',\n  $3,\n  NOW()\nFROM sequences s\nJOIN leads l ON l.id = s.lead_id\nLEFT JOIN sequence_steps ss ON ss.sequence_id = s.id\nWHERE s.id = $1\nGROUP BY s.id, l.company\nRETURNING id AS step_id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.sequence_id,\n  String($json.followup_delay_days || 5),\n  $json.strategy_used || 'value_led'\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-025",
+      "name": "Pause Sequence",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4040,
+        480
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sequences  SET status = 'paused',       updated_at = NOW() WHERE id  = $1;\nUPDATE leads      SET status = 'not_interested', updated_at = NOW() WHERE id  = $2;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.sequence_id, $json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-026",
+      "name": "Escalate to Human",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4040,
+        620
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (\n  lead_id, reason, context, status, created_at\n) VALUES (\n  $1, $2, $3::jsonb, 'pending', NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  $json.escalation_reason || $json.action_reason || 'requires human review',\n  JSON.stringify({\n    intent:            $json.intent,\n    sentiment:         $json.sentiment,\n    urgency:           $json.planner_urgency,\n    action:            $json.action,\n    reply_summary:     $json.reply_summary,\n    reply_draft:       $json.reply_draft,\n    confidence:        $json.planner_confidence,\n    step_number:       $json.step_number,\n    thread_id:         $json.thread_id,\n    workflow:          'WF-06',\n    execution_id:      $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-027",
+      "name": "Close Unsubscribe",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4040,
+        760
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sequences SET status = 'stopped',      updated_at = NOW() WHERE id  = $1;\nUPDATE leads     SET status = 'unsubscribed',  updated_at = NOW() WHERE id  = $2;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.sequence_id, $json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-028",
+      "name": "Update Contact Notes",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4040,
+        900
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads\nSET\n  notes      = COALESCE(notes, '') || $2,\n  updated_at = NOW()\nWHERE id = $1;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  `\\n[${new Date().toISOString().slice(0,10)}] Referral noted — ${$json.referral_name || $json.reply_summary}`\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-029",
+      "name": "Notify Slack — Escalation",
+      "type": "n8n-nodes-base.slack",
+      "position": [
+        4280,
+        620
+      ],
+      "parameters": {
+        "operation": "post",
+        "channel": "={{ $env.SLACK_ESCALATION_CHANNEL || '#agent-x-escalations' }}",
+        "text": "={{ `🧠 *WF-06 Escalation — Human Review Needed*\\n*Lead:* ${$json.from_email} (${$json.company})  |  *Tier:* ${$json.tier}\\n*Intent:* ${$json.intent}  |  *Sentiment:* ${$json.sentiment}  |  *Urgency:* ${$json.planner_urgency}\\n*Reason:* ${$json.escalation_reason || $json.action_reason}\\n*Confidence:* ${Math.round($json.planner_confidence * 100)}%\\n\\n*Their reply:*\\n_${($json.body_text || '').slice(0,300)}_\\n\\n*Draft reply (if any):*\\n${$json.reply_draft ? '_' + $json.reply_draft.slice(0,200) + '_' : 'none'}\\nReview: ${$env.N8N_WEBHOOK_BASE_URL}/escalations/${$items('Escalate to Human')[0].json.id}` }}",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "slack-main",
+          "name": "AZOX Slack"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-030",
+      "name": "Emit reply.received Event",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        5000,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'reply.received',\n  $1::jsonb,\n  NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  lead_id:           $json.lead_id,\n  sequence_id:       $json.sequence_id,\n  step_id:           $json.step_id,\n  intent:            $json.intent,\n  sentiment:         $json.sentiment,\n  urgency:           $json.planner_urgency,\n  action_taken:      $json.action,\n  planner_confidence: $json.planner_confidence,\n  tier:              $json.tier,\n  thread_id:         $json.thread_id,\n  execution_id:      $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-031",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        5240,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES ('reply_processed', $1, $2::jsonb, NOW());",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify({\n    workflow:           'WF-06',\n    event:              'reply.received',\n    intent:             $json.intent,\n    sentiment:          $json.sentiment,\n    action_taken:       $json.action,\n    planner_confidence: $json.planner_confidence,\n    step_number:        $json.step_number,\n    execution_id:       $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-032",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        520
+      ],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst msg = err.message || 'Unknown error in WF-06';\n\nconst isAuth      = msg.includes('UNAUTHORIZED_REQUEST');\nconst isUnmatched = msg.includes('UNMATCHED_REPLY');\nconst isParseFail = msg.includes('REPLY_PARSE_FAILED');\n\nreturn [{\n  json: {\n    status:       isAuth ? 'unauthorized' : isUnmatched ? 'unmatched' : isParseFail ? 'parse_error' : 'error',\n    message:      msg,\n    workflow:     'WF-06',\n    timestamp:    new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-033",
+      "name": "Return Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        680,
+        520
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($node['Handle Error'].json) }}",
+        "options": {
+          "responseCode": "={{ $node['Handle Error'].json.status === 'unauthorized' ? 401 : $node['Handle Error'].json.status === 'unmatched' ? 404 : 422 }}"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-034",
+      "name": "ACK Immediately",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        440,
+        160
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"accepted\", \"message\": \"processing\" }",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-035",
+      "name": "Check Idempotency Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        680,
+        160
+      ],
+      "parameters": {
+        "operation": "get",
+        "key": "={{ `reply:${$json.message_id}` }}"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-036",
+      "name": "Already Processed?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        920,
+        160
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.value }}",
+              "operation": "isEmpty"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-037",
+      "name": "Set Idempotency Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1160,
+        160
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `reply:${$items('Extract Reply Data')[0].json.message_id}` }}",
+        "value": "={{ new Date().toISOString() }}",
+        "expire": true,
+        "ttl": 86400
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf06-node-038",
+      "name": "Stop — Duplicate Message",
+      "type": "n8n-nodes-base.noOp",
+      "position": [
+        1160,
+        60
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Webhook Reply Received": {
+      "main": [
+        [
+          {
+            "node": "Verify Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Token": {
+      "main": [
+        [
+          {
+            "node": "ACK Immediately",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Extract Reply Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Reply Data": {
+      "main": [
+        [
+          {
+            "node": "Check Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match Lead by Thread ID": {
+      "main": [
+        [
+          {
+            "node": "Merge Lead Match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fallback: Match by Email": {
+      "main": [
+        [
+          {
+            "node": "Merge Lead Match",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Lead Match": {
+      "main": [
+        [
+          {
+            "node": "Load Conversation History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Conversation History": {
+      "main": [
+        [
+          {
+            "node": "Check Memory Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Memory Summary": {
+      "main": [
+        [
+          {
+            "node": "Build Conversation Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Conversation Context": {
+      "main": [
+        [
+          {
+            "node": "Classify Intent via OpenAI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Intent via OpenAI": {
+      "main": [
+        [
+          {
+            "node": "Parse Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Intent": {
+      "main": [
+        [
+          {
+            "node": "Save Reply to Conversations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Reply to Conversations": {
+      "main": [
+        [
+          {
+            "node": "Update Memory Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Memory Summary": {
+      "main": [
+        [
+          {
+            "node": "Write Memory to Redis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Memory to Redis": {
+      "main": [
+        [
+          {
+            "node": "Agent Planner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agent Planner": {
+      "main": [
+        [
+          {
+            "node": "Parse Planner Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Planner Decision": {
+      "main": [
+        [
+          {
+            "node": "Route Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Action": {
+      "main": [
+        [
+          {
+            "node": "Guardrail Check Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Trigger WF-07 Meeting",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Schedule Follow-up Step",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Pause Sequence",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Escalate to Human",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Close Unsubscribe",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Contact Notes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardrail Check Reply": {
+      "main": [
+        [
+          {
+            "node": "Reply Guardrail OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reply Guardrail OK?": {
+      "main": [
+        [
+          {
+            "node": "Send Reply via Gmail",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Escalate to Human",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reply via Gmail": {
+      "main": [
+        [
+          {
+            "node": "Log Reply Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Reply Sent": {
+      "main": [
+        [
+          {
+            "node": "Emit reply.received Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger WF-07 Meeting": {
+      "main": [
+        [
+          {
+            "node": "Emit reply.received Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Follow-up Step": {
+      "main": [
+        [
+          {
+            "node": "Emit reply.received Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pause Sequence": {
+      "main": [
+        [
+          {
+            "node": "Emit reply.received Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Close Unsubscribe": {
+      "main": [
+        [
+          {
+            "node": "Emit reply.received Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Contact Notes": {
+      "main": [
+        [
+          {
+            "node": "Emit reply.received Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate to Human": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack — Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Slack — Escalation": {
+      "main": [
+        [
+          {
+            "node": "Emit reply.received Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Emit reply.received Event": {
+      "main": [
+        [
+          {
+            "node": "Log Activity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Error": {
+      "main": [
+        [
+          {
+            "node": "Return Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ACK Immediately": {
+      "main": [
+        []
+      ]
+    },
+    "Check Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "Already Processed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already Processed?": {
+      "main": [
+        [
+          {
+            "node": "Set Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop — Duplicate Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "Match Lead by Thread ID",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fallback: Match by Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    "azox",
+    "agent-x",
+    "reply-classification",
+    "v2"
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "version": "2.0.0"
+  }
+}

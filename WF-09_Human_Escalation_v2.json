@@ -1,0 +1,1254 @@
+{
+  "name": "WF-09 Human Escalation",
+  "nodes": [
+    {
+      "id": "wf09-node-001",
+      "name": "Webhook Escalation Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "path": "escalate",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-002",
+      "name": "Verify Token",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const headers = $input.first().json.headers || {};\nconst token   = headers['x-internal-token'] || headers['X-Internal-Token'];\n\nif (!token || token !== $env.INTERNAL_WEBHOOK_SECRET) {\n  throw new Error('UNAUTHORIZED_REQUEST: invalid or missing token');\n}\n\nconst body = $input.first().json.body || $input.first().json;\nreturn [{ json: body }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-003",
+      "name": "ACK Immediately",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        440,
+        160
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"accepted\", \"message\": \"escalation processing\" }",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-004",
+      "name": "Check Idempotency Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "operation": "get",
+        "key": "={{ `escalation:${$json.execution_id || $json.lead_id + ':' + $json.reason}` }}"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-005",
+      "name": "Already Escalated?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        920,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.value }}",
+              "operation": "isEmpty"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-006",
+      "name": "Stop — Already Escalated",
+      "type": "n8n-nodes-base.noOp",
+      "position": [
+        1160,
+        160
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-007",
+      "name": "Set Idempotency Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1160,
+        300
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `escalation:${$json.execution_id || $json.lead_id + ':' + $json.reason}` }}",
+        "value": "={{ new Date().toISOString() }}",
+        "expire": true,
+        "ttl": 86400
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-008",
+      "name": "Load Lead Context",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  l.id,\n  l.email,\n  l.first_name,\n  l.last_name,\n  l.full_name,\n  l.title,\n  l.company,\n  l.icp_tier        AS tier,\n  l.score,\n  l.status,\n  l.stage,\n  l.score_breakdown,\n  lb.brief,\n  c.industry,\n  c.employee_count,\n  c.website,\n  c.annual_revenue,\n  -- last 5 conversation turns\n  (\n    SELECT json_agg(row_to_json(conv) ORDER BY conv.sent_at DESC)\n    FROM (\n      SELECT direction, subject, body_text, intent, sentiment, sent_at\n      FROM conversations\n      WHERE lead_id = l.id\n      ORDER BY sent_at DESC\n      LIMIT 5\n    ) conv\n  ) AS recent_conversations,\n  -- active sequence info\n  s.id              AS sequence_id,\n  s.status          AS sequence_status,\n  -- existing open escalation count (prevent spam)\n  (\n    SELECT COUNT(*) FROM escalations e2\n    WHERE e2.lead_id = l.id AND e2.status = 'pending'\n  ) AS open_escalation_count\nFROM leads l\nLEFT JOIN lead_briefs  lb ON lb.lead_id   = l.id\nLEFT JOIN companies    c  ON c.id         = l.company_id\nLEFT JOIN sequences    s  ON s.id         = l.sequence_id\nWHERE l.id = $1\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-009",
+      "name": "Consolidate Context",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1640,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// ── Consolidate trigger payload + DB lead context ────────────────────────\nconst trigger = $items('Set Idempotency Key')[0].json;\nconst lead    = $input.first().json;\n\nif (!lead || !lead.id) {\n  throw new Error(`LEAD_NOT_FOUND: ${trigger.lead_id}`);\n}\n\nconst parseCol = (v) => {\n  if (!v) return {};\n  if (typeof v === 'object') return v;\n  try { return JSON.parse(v); } catch(e) { return {}; }\n};\n\nconst brief            = parseCol(lead.brief);\nconst scoreBreakdown   = parseCol(lead.score_breakdown);\nconst triggerContext   = parseCol(trigger.context);\nconst recentConvos     = lead.recent_conversations || [];\n\n// Format conversation history for AI prompt\nconst convoLines = (Array.isArray(recentConvos) ? recentConvos : [])\n  .slice(0, 5)\n  .map(c => `[${c.direction === 'outbound' ? 'US' : 'LEAD'} @ ${(c.sent_at||'').slice(0,10)}] ${(c.body_text||'').slice(0,300)}`)\n  .join('\\n');\n\n// Build full context string for the briefing prompt\nconst fullContext = [\n  `LEAD: ${lead.full_name || lead.email} | ${lead.title} at ${lead.company}`,\n  `TIER: ${lead.tier} | SCORE: ${lead.score} | STATUS: ${lead.status}`,\n  `INDUSTRY: ${lead.industry || 'Unknown'} | SIZE: ${lead.employee_count || '?'} employees`,\n  `ESCALATION REASON: ${trigger.reason || 'unspecified'}`,\n  `SOURCE WORKFLOW: ${triggerContext.workflow || trigger.source_workflow || 'unknown'}`,\n  `URGENCY: ${triggerContext.urgency || 'MEDIUM'}`,\n  triggerContext.intent     ? `INTENT CLASSIFIED: ${triggerContext.intent}` : '',\n  triggerContext.reply_summary ? `REPLY SUMMARY: ${triggerContext.reply_summary}` : '',\n  triggerContext.reply_draft   ? `DRAFT REPLY (if any):\\n${triggerContext.reply_draft}` : '',\n  triggerContext.flags         ? `GUARDRAIL FLAGS: ${(triggerContext.flags||[]).join(', ')}` : '',\n  brief.outreach_angles ? `OUTREACH ANGLES: ${(brief.outreach_angles||[]).slice(0,2).join('; ')}` : '',\n  convoLines ? `\\nRECENT CONVERSATION:\\n${convoLines}` : ''\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    ...lead,\n    ...trigger,\n    lead_id:               lead.id,\n    brief,\n    score_breakdown:       scoreBreakdown,\n    trigger_context:       triggerContext,\n    full_context:          fullContext.slice(0, 4000),\n    open_escalation_count: parseInt(lead.open_escalation_count || 0),\n    urgency:               triggerContext.urgency || 'MEDIUM',\n    source_workflow:       triggerContext.workflow || trigger.source_workflow || 'unknown',\n    escalation_reason:     trigger.reason || 'unspecified'\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-010",
+      "name": "Insert Escalation Record",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2120,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (\n  lead_id, reason, context, status, created_at\n) VALUES (\n  $1, $2, $3::jsonb, 'pending', NOW()\n)\nRETURNING id AS escalation_id, created_at;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  $json.escalation_reason,\n  JSON.stringify({\n    source_workflow:  $json.source_workflow,\n    urgency:          $json.urgency,\n    trigger_context:  $json.trigger_context,\n    lead_status:      $json.status,\n    tier:             $json.tier,\n    score:            $json.score,\n    execution_id:     $json.execution_id || $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-011",
+      "name": "Attach Escalation ID",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2360,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const ctx          = $items('Consolidate Context')[0].json;\nconst escRecord    = $input.first().json;\n\nreturn [{\n  json: {\n    ...ctx,\n    escalation_id:  escRecord.escalation_id,\n    escalation_created_at: escRecord.created_at\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-012",
+      "name": "Generate AI Briefing",
+      "type": "n8n-nodes-base.openAi",
+      "position": [
+        2600,
+        300
+      ],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert B2B sales coach summarizing a lead situation for a human sales rep who needs to take over from an AI agent.\n\nYour briefing must be specific, actionable, and grounded in the facts provided.\nNEVER invent details not present in the context.\n\nOutput ONLY valid JSON with exactly these keys:\n{\n  \"headline\": \"one sentence — the single most important thing the rep needs to know right now\",\n  \"bullets\": [\"5 specific factual points about this lead and situation — names, scores, signals, what was said\"],\n  \"discovery_questions\": [\"3 specific questions the rep should ask this lead in a call\"],\n  \"recommended_action\": \"one specific, concrete action the rep should take (e.g. call within 2h, send revised proposal, loop in solutions engineer)\",\n  \"urgency\": \"HIGH|MEDIUM|LOW\",\n  \"tone_guidance\": \"one sentence on tone — e.g. they are frustrated, be empathetic; or they are excited, be direct\"\n}"
+            },
+            {
+              "role": "user",
+              "content": "={{ $json.full_context }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 700
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-main",
+          "name": "AZOX OpenAI"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-013",
+      "name": "Parse AI Briefing",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2840,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// ── Parse the AI briefing JSON response ──────────────────────────────────\nconst raw = $input.first().json?.choices?.[0]?.message?.content\n         || $input.first().json?.message?.content || '';\n\nlet briefing = {};\ntry {\n  const s = raw.indexOf('{');\n  const e = raw.lastIndexOf('}');\n  if (s === -1 || e === -1) throw new Error('no JSON');\n  briefing = JSON.parse(raw.slice(s, e + 1));\n} catch(_) {\n  // Graceful fallback — construct a minimal briefing from raw context\n  const ctx = $items('Attach Escalation ID')[0].json;\n  briefing = {\n    headline:            `${ctx.escalation_reason} — ${ctx.full_name || ctx.email} at ${ctx.company}`,\n    bullets:             [\n      `Tier ${ctx.tier} lead, score ${ctx.score}`,\n      `Status: ${ctx.status}`,\n      `Source workflow: ${ctx.source_workflow}`,\n      `Urgency: ${ctx.urgency}`,\n      `Reason: ${ctx.escalation_reason}`\n    ],\n    discovery_questions: [\n      'What specific concerns do you have?',\n      'What would need to be true for this to move forward?',\n      'Who else is involved in this decision?'\n    ],\n    recommended_action:  'Review conversation history and reach out directly',\n    urgency:             ctx.urgency || 'MEDIUM',\n    tone_guidance:       'Approach with care — review context before responding'\n  };\n}\n\nconst ctx = $items('Attach Escalation ID')[0].json;\n\n// Format bullets as a numbered list for Slack\nconst bulletLines = (briefing.bullets || [])\n  .slice(0, 5)\n  .map((b, i) => `${i + 1}. ${b}`)\n  .join('\\n');\n\nconst questionLines = (briefing.discovery_questions || [])\n  .slice(0, 3)\n  .map((q, i) => `${i + 1}. ${q}`)\n  .join('\\n');\n\n// Build the review URL (points to a simple resolution handler webhook)\nconst reviewUrl = `${$env.N8N_WEBHOOK_BASE_URL}/webhook/escalation-resolve`;\n\nreturn [{\n  json: {\n    ...ctx,\n    briefing_headline:     briefing.headline          || '',\n    briefing_bullets:      briefing.bullets           || [],\n    briefing_questions:    briefing.discovery_questions || [],\n    briefing_action:       briefing.recommended_action || '',\n    briefing_urgency:      briefing.urgency            || ctx.urgency || 'MEDIUM',\n    briefing_tone:         briefing.tone_guidance      || '',\n    bullet_lines:          bulletLines,\n    question_lines:        questionLines,\n    review_url:            reviewUrl,\n    urgency_emoji:         briefing.urgency === 'HIGH' ? '🔴' : briefing.urgency === 'MEDIUM' ? '🟡' : '🟢'\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-014",
+      "name": "Save Briefing to DB",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3080,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE escalations\nSET\n  context = context || $2::jsonb,\n  updated_at = NOW()\nWHERE id = $1::uuid;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.escalation_id,\n  JSON.stringify({\n    briefing_headline:  $json.briefing_headline,\n    briefing_bullets:   $json.briefing_bullets,\n    briefing_questions: $json.briefing_questions,\n    briefing_action:    $json.briefing_action,\n    briefing_urgency:   $json.briefing_urgency,\n    briefing_tone:      $json.briefing_tone\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-015",
+      "name": "Send Slack Escalation",
+      "type": "n8n-nodes-base.slack",
+      "position": [
+        3320,
+        300
+      ],
+      "parameters": {
+        "operation": "post",
+        "channel": "={{ $env.SLACK_ESCALATION_CHANNEL || '#agent-x-escalations' }}",
+        "text": "={{ `${$json.urgency_emoji} *Escalation — Human Review Needed* | ${$json.company} | ${$json.briefing_urgency} priority` }}",
+        "otherOptions": {
+          "blocks": "={{ JSON.stringify([\n  {\n    type: 'header',\n    text: { type: 'plain_text', text: `${$json.urgency_emoji} Escalation — ${$json.briefing_urgency} Priority`, emoji: true }\n  },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Lead:*\\n${$json.full_name || $json.email}` },\n      { type: 'mrkdwn', text: `*Company:*\\n${$json.company}` },\n      { type: 'mrkdwn', text: `*Tier:* ${$json.tier}  |  *Score:* ${$json.score}` },\n      { type: 'mrkdwn', text: `*Reason:*\\n${$json.escalation_reason}` }\n    ]\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*📋 Situation*\\n${$json.briefing_headline}` }\n  },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*Key Facts*\\n${$json.bullet_lines}` }\n  },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*💬 Suggested Discovery Questions*\\n${$json.question_lines}` }\n  },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*🎯 Recommended Action*\\n${$json.briefing_action}` }\n  },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*🗣 Tone Guidance*\\n${$json.briefing_tone}` }\n  },\n  { type: 'divider' },\n  {\n    type: 'actions',\n    block_id: `escalation_actions_${$json.escalation_id}`,\n    elements: [\n      {\n        type: 'button',\n        action_id: 'approve_escalation',\n        text: { type: 'plain_text', text: '✅ Approve & Send', emoji: true },\n        style: 'primary',\n        value: JSON.stringify({ escalation_id: $json.escalation_id, lead_id: $json.lead_id, action: 'approve' })\n      },\n      {\n        type: 'button',\n        action_id: 'edit_escalation',\n        text: { type: 'plain_text', text: '✏️ Edit Draft', emoji: true },\n        value: JSON.stringify({ escalation_id: $json.escalation_id, lead_id: $json.lead_id, action: 'edit' })\n      },\n      {\n        type: 'button',\n        action_id: 'takeover_escalation',\n        text: { type: 'plain_text', text: '🙋 Take Over', emoji: true },\n        style: 'danger',\n        value: JSON.stringify({ escalation_id: $json.escalation_id, lead_id: $json.lead_id, action: 'takeover' })\n      }\n    ]\n  },\n  {\n    type: 'context',\n    elements: [{ type: 'mrkdwn', text: `Escalation ID: ${$json.escalation_id}  |  Source: ${$json.source_workflow}  |  <${$env.N8N_WEBHOOK_BASE_URL}/escalations/${$json.escalation_id}|View full context>` }]\n  }\n]) }}"
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "slack-main",
+          "name": "AZOX Slack"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-016",
+      "name": "Save Slack Message TS",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        3560,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const slackResp = $input.first().json;\nconst ctx       = $items('Parse AI Briefing')[0].json;\n\n// Slack returns ts (message timestamp) and channel in the response\nconst slackTs      = slackResp.ts      || slackResp.message?.ts      || null;\nconst slackChannel = slackResp.channel || null;\n\nreturn [{\n  json: {\n    ...ctx,\n    slack_ts:      slackTs,\n    slack_channel: slackChannel\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-017",
+      "name": "Persist Slack TS",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3800,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE escalations\nSET\n  context    = context || $2::jsonb,\n  updated_at = NOW()\nWHERE id = $1::uuid;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.escalation_id,\n  JSON.stringify({\n    slack_ts:      $json.slack_ts,\n    slack_channel: $json.slack_channel\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-018",
+      "name": "Set 4h Reminder Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        4040,
+        300
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `escalation:reminder:${$json.escalation_id}` }}",
+        "value": "={{ JSON.stringify({ escalation_id: $json.escalation_id, lead_id: $json.lead_id, slack_ts: $json.slack_ts, slack_channel: $json.slack_channel, urgency: $json.briefing_urgency }) }}",
+        "expire": true,
+        "ttl": 14400
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-019",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4280,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES ('escalation_created', $1, $2::jsonb, NOW());",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify({\n    workflow:       'WF-09',\n    escalation_id:  $json.escalation_id,\n    reason:         $json.escalation_reason,\n    urgency:        $json.briefing_urgency,\n    source:         $json.source_workflow,\n    execution_id:   $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-020",
+      "name": "Webhook Slack Action",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        200,
+        700
+      ],
+      "parameters": {
+        "path": "escalation-resolve",
+        "httpMethod": "POST",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-021",
+      "name": "Parse Slack Action",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        680,
+        700
+      ],
+      "parameters": {
+        "functionCode": "// ── Parse Slack interactive message payload ───────────────────────────────\n// Slack sends a URL-encoded 'payload' field with the action data.\n// The payload contains actions[], user info, and the original block value.\n\nconst body = $input.first().json.body || $input.first().json;\n\n// Slack sends payload as URL-encoded string in body.payload\nlet slackPayload = {};\ntry {\n  const raw = body.payload || body;\n  slackPayload = typeof raw === 'string' ? JSON.parse(decodeURIComponent(raw)) : raw;\n} catch(e) {\n  throw new Error('SLACK_PARSE_FAILED: ' + e.message);\n}\n\nconst action    = slackPayload.actions?.[0] || {};\nconst actionId  = action.action_id || '';\nconst valueRaw  = action.value     || '{}';\nconst user      = slackPayload.user || {};\nconst msgTs     = slackPayload.message?.ts || slackPayload.container?.message_ts || null;\nconst channelId = slackPayload.channel?.id || null;\n\nlet actionValue = {};\ntry { actionValue = JSON.parse(valueRaw); } catch(_) {}\n\nconst actionType = actionValue.action || actionId.replace('_escalation', '');\n\nreturn [{\n  json: {\n    escalation_id:  actionValue.escalation_id || null,\n    lead_id:        actionValue.lead_id        || null,\n    action_type:    actionType,   // approve | edit | takeover\n    ae_user_id:     user.id       || null,\n    ae_username:    user.username || user.name || 'unknown',\n    ae_real_name:   user.real_name || '',\n    slack_ts:       msgTs,\n    slack_channel:  channelId,\n    received_at:    new Date().toISOString()\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-022",
+      "name": "Route Action",
+      "type": "n8n-nodes-base.switch",
+      "position": [
+        680,
+        700
+      ],
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.action_type }}",
+        "rules": {
+          "rules": [
+            {
+              "value2": "approve",
+              "output": 0
+            },
+            {
+              "value2": "edit",
+              "output": 1
+            },
+            {
+              "value2": "takeover",
+              "output": 2
+            }
+          ]
+        },
+        "fallbackOutput": 2
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-023",
+      "name": "Resolve — Approved",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        920,
+        580
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE escalations\nSET\n  status       = 'approved',\n  resolved_by  = $2,\n  resolved_at  = NOW(),\n  updated_at   = NOW()\nWHERE id = $1::uuid\nRETURNING id, lead_id, context;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.escalation_id, $json.ae_username ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-024",
+      "name": "Resolve — Edit Requested",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        920,
+        720
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE escalations\nSET\n  status     = 'editing',\n  resolved_by = $2,\n  updated_at = NOW()\nWHERE id = $1::uuid\nRETURNING id, lead_id, context;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.escalation_id, $json.ae_username ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-025",
+      "name": "Resolve — Taken Over",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        920,
+        860
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE escalations\nSET\n  status       = 'taken_over',\n  resolved_by  = $2,\n  resolved_at  = NOW(),\n  updated_at   = NOW()\nWHERE id = $1::uuid;\n\n-- Pause the lead's sequence so AI stops sending\nUPDATE sequences s\nSET status = 'paused', updated_at = NOW()\nFROM leads l\nWHERE s.id = l.sequence_id\n  AND l.id = $3::uuid\n  AND s.status = 'active';\n\n-- Flag lead as human-owned\nUPDATE leads\nSET status = 'human_owned', updated_at = NOW()\nWHERE id = $3::uuid;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.escalation_id, $json.ae_username, $json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-026",
+      "name": "Slack — Acknowledge Action",
+      "type": "n8n-nodes-base.slack",
+      "position": [
+        1160,
+        720
+      ],
+      "parameters": {
+        "operation": "post",
+        "channel": "={{ $json.slack_channel || $env.SLACK_ESCALATION_CHANNEL || '#agent-x-escalations' }}",
+        "text": "={{ `✅ *Escalation ${$json.action_type === 'approve' ? 'Approved' : $json.action_type === 'edit' ? 'Sent for Edit' : 'Taken Over'}*\\nHandled by: @${$json.ae_username}  |  Escalation ID: ${$json.escalation_id}` }}",
+        "otherOptions": {
+          "threadTs": "={{ $json.slack_ts }}"
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "slack-main",
+          "name": "AZOX Slack"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-027",
+      "name": "Clear Reminder Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1400,
+        720
+      ],
+      "parameters": {
+        "operation": "delete",
+        "key": "={{ `escalation:reminder:${$json.escalation_id}` }}"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-028",
+      "name": "Emit escalation.resolved",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1640,
+        720
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'escalation.resolved',\n  $1::jsonb,\n  NOW()\n);",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  escalation_id: $json.escalation_id,\n  lead_id:       $json.lead_id,\n  action_type:   $json.action_type,\n  resolved_by:   $json.ae_username,\n  execution_id:  $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-029",
+      "name": "Cron — Reminder Check",
+      "type": "n8n-nodes-base.cron",
+      "position": [
+        200,
+        1100
+      ],
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 30,
+              "unit": "minutes"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-030",
+      "name": "Fetch Unresolved Escalations",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        440,
+        1100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  e.id          AS escalation_id,\n  e.lead_id,\n  e.reason,\n  e.created_at,\n  e.context,\n  l.full_name,\n  l.email,\n  l.company,\n  l.icp_tier    AS tier\nFROM escalations e\nJOIN leads l ON l.id = e.lead_id\nWHERE e.status = 'pending'\n  AND e.created_at < NOW() - INTERVAL '4 hours'\n  AND (e.reminder_sent IS NULL OR e.reminder_sent = FALSE)\nLIMIT 10;"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-031",
+      "name": "Any Unresolved?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        680,
+        1100
+      ],
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $items().length }}",
+              "operation": "largerEqual",
+              "value2": 1
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-032",
+      "name": "Prep Reminder Context",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        920,
+        1100
+      ],
+      "parameters": {
+        "functionCode": "// Parse escalation context and recover the original Slack ts for threading\nconst esc = $input.first().json;\nconst ctx = typeof esc.context === 'string' ? JSON.parse(esc.context) : (esc.context || {});\n\nconst hoursSince = Math.round(\n  (Date.now() - new Date(esc.created_at).getTime()) / (1000 * 60 * 60) * 10\n) / 10;\n\nreturn [{\n  json: {\n    ...esc,\n    slack_ts:         ctx.slack_ts      || null,\n    slack_channel:    ctx.slack_channel || $env.SLACK_ESCALATION_CHANNEL || '#agent-x-escalations',\n    briefing_action:  ctx.briefing_action || 'Review and respond to this lead',\n    hours_pending:    hoursSince,\n    urgency:          ctx.briefing_urgency || 'MEDIUM',\n    urgency_emoji:    (ctx.briefing_urgency === 'HIGH') ? '🔴' : '🟡'\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-033",
+      "name": "Send Reminder Thread",
+      "type": "n8n-nodes-base.slack",
+      "position": [
+        1160,
+        1100
+      ],
+      "parameters": {
+        "operation": "post",
+        "channel": "={{ $json.slack_channel }}",
+        "text": "={{ `⏰ *Reminder — Escalation Still Pending (${$json.hours_pending}h)*\\n*Lead:* ${$json.full_name || $json.email} at ${$json.company}  |  *Tier:* ${$json.tier}\\n*Reason:* ${$json.reason}\\n*Action needed:* ${$json.briefing_action}\\nEscalation ID: ${$json.escalation_id}` }}",
+        "otherOptions": {
+          "threadTs": "={{ $json.slack_ts }}"
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "slack-main",
+          "name": "AZOX Slack"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-034",
+      "name": "Mark Reminder Sent",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1400,
+        1100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE escalations\nSET\n  reminder_sent    = TRUE,\n  reminder_sent_at = NOW(),\n  updated_at       = NOW()\nWHERE id = $1::uuid;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.escalation_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-035",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        480
+      ],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst msg = err.message || 'Unknown error in WF-09';\n\nreturn [{\n  json: {\n    status:       msg.includes('UNAUTHORIZED') ? 'unauthorized' :\n                  msg.includes('LEAD_NOT_FOUND') ? 'lead_not_found' :\n                  msg.includes('SLACK_PARSE') ? 'parse_error' : 'error',\n    message:      msg,\n    workflow:     'WF-09',\n    timestamp:    new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-036",
+      "name": "Return Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        680,
+        480
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($node['Handle Error'].json) }}",
+        "options": {
+          "responseCode": "={{ $node['Handle Error'].json.status === 'unauthorized' ? 401 : 422 }}"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-037",
+      "name": "Too Many Open Escalations?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        2120,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.open_escalation_count }}",
+              "operation": "smallerEqual",
+              "value2": 1
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-038",
+      "name": "Stop — Too Many Escalations",
+      "type": "n8n-nodes-base.noOp",
+      "position": [
+        2120,
+        460
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "wf09-node-039",
+      "name": "Verify Slack Signature",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        700
+      ],
+      "parameters": {
+        "functionCode": "// ── Slack signature verification ─────────────────────────────────────────\n// Validates X-Slack-Signature and X-Slack-Request-Timestamp headers.\n// Protects against spoofed requests to /webhook/escalation-resolve.\n//\n// Reference: https://api.slack.com/authentication/verifying-requests-from-slack\n//\n// Required env var: SLACK_SIGNING_SECRET (from Slack app → Basic Information)\n\nconst body    = $input.first().json;\nconst headers = body.headers || {};\n\nconst slackSig       = headers['x-slack-signature']        || headers['X-Slack-Signature']        || '';\nconst slackTimestamp = headers['x-slack-request-timestamp'] || headers['X-Slack-Request-Timestamp'] || '';\nconst rawBody        = body.rawBody || body.body || '';\n\n// ── Step 1: Reject missing headers ───────────────────────────────────────\nif (!slackSig || !slackTimestamp) {\n  throw new Error('SLACK_SIGNATURE_MISSING: required headers not present');\n}\n\n// ── Step 2: Reject stale requests (replay attack protection) ─────────────\n// Slack recommendation: reject if timestamp is > 5 minutes old\nconst nowSeconds  = Math.floor(Date.now() / 1000);\nconst tsDiff      = Math.abs(nowSeconds - parseInt(slackTimestamp, 10));\nif (tsDiff > 300) {\n  throw new Error(`SLACK_TIMESTAMP_STALE: request is ${tsDiff}s old (max 300s)`);\n}\n\n// ── Step 3: Compute expected signature ───────────────────────────────────\nconst signingSecret = $env.SLACK_SIGNING_SECRET;\nif (!signingSecret) {\n  throw new Error('SLACK_SIGNING_SECRET env var not configured');\n}\n\n// Build the base string Slack uses for signing\nconst baseString = `v0:${slackTimestamp}:${rawBody}`;\n\n// HMAC-SHA256 using Node.js crypto (available in n8n Function nodes)\nconst crypto    = require('crypto');\nconst hmac      = crypto.createHmac('sha256', signingSecret);\nhmac.update(baseString);\nconst computed  = 'v0=' + hmac.digest('hex');\n\n// ── Step 4: Timing-safe comparison (prevents timing attacks) ─────────────\nconst sigBuffer      = Buffer.from(slackSig, 'utf8');\nconst computedBuffer = Buffer.from(computed, 'utf8');\n\nconst signaturesMatch =\n  sigBuffer.length === computedBuffer.length &&\n  crypto.timingSafeEqual(sigBuffer, computedBuffer);\n\nif (!signaturesMatch) {\n  throw new Error('SLACK_SIGNATURE_INVALID: signature mismatch — possible spoofed request');\n}\n\n// Signature valid — pass body through to Parse Slack Action\nreturn [{ json: body }];\n"
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Webhook Escalation Trigger": {
+      "main": [
+        [
+          {
+            "node": "Verify Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Token": {
+      "main": [
+        [
+          {
+            "node": "ACK Immediately",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Check Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ACK Immediately": {
+      "main": [
+        []
+      ]
+    },
+    "Check Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "Already Escalated?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already Escalated?": {
+      "main": [
+        [
+          {
+            "node": "Set Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop — Already Escalated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "Load Lead Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Lead Context": {
+      "main": [
+        [
+          {
+            "node": "Consolidate Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidate Context": {
+      "main": [
+        [
+          {
+            "node": "Too Many Open Escalations?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Escalation Record": {
+      "main": [
+        [
+          {
+            "node": "Attach Escalation ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Escalation ID": {
+      "main": [
+        [
+          {
+            "node": "Generate AI Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate AI Briefing": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Briefing": {
+      "main": [
+        [
+          {
+            "node": "Save Briefing to DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Briefing to DB": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Escalation": {
+      "main": [
+        [
+          {
+            "node": "Save Slack Message TS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Slack Message TS": {
+      "main": [
+        [
+          {
+            "node": "Persist Slack TS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Slack TS": {
+      "main": [
+        [
+          {
+            "node": "Set 4h Reminder Key",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set 4h Reminder Key": {
+      "main": [
+        [
+          {
+            "node": "Log Activity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Slack Action": {
+      "main": [
+        [
+          {
+            "node": "Verify Slack Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Slack Action": {
+      "main": [
+        [
+          {
+            "node": "Route Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Action": {
+      "main": [
+        [
+          {
+            "node": "Resolve — Approved",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resolve — Edit Requested",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resolve — Taken Over",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve — Approved": {
+      "main": [
+        [
+          {
+            "node": "Slack — Acknowledge Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve — Edit Requested": {
+      "main": [
+        [
+          {
+            "node": "Slack — Acknowledge Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve — Taken Over": {
+      "main": [
+        [
+          {
+            "node": "Slack — Acknowledge Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack — Acknowledge Action": {
+      "main": [
+        [
+          {
+            "node": "Clear Reminder Key",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Reminder Key": {
+      "main": [
+        [
+          {
+            "node": "Emit escalation.resolved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cron — Reminder Check": {
+      "main": [
+        [
+          {
+            "node": "Fetch Unresolved Escalations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Unresolved Escalations": {
+      "main": [
+        [
+          {
+            "node": "Any Unresolved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Unresolved?": {
+      "main": [
+        [
+          {
+            "node": "Prep Reminder Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Prep Reminder Context": {
+      "main": [
+        [
+          {
+            "node": "Send Reminder Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reminder Thread": {
+      "main": [
+        [
+          {
+            "node": "Mark Reminder Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Error": {
+      "main": [
+        [
+          {
+            "node": "Return Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Too Many Open Escalations?": {
+      "main": [
+        [
+          {
+            "node": "Insert Escalation Record",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop — Too Many Escalations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Slack Signature": {
+      "main": [
+        [
+          {
+            "node": "Parse Slack Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    "azox",
+    "agent-x",
+    "human-escalation",
+    "v2"
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "version": "2.0.0",
+    "changelog": "v2: (1) Spam guard — skip escalation if lead already has 2+ pending; (2) Slack signature verification on /webhook/escalation-resolve"
+  }
+}

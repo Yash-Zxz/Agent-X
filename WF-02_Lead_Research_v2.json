@@ -1,0 +1,604 @@
+{
+  "name": "WF-02 Lead Research",
+  "nodes": [
+    {
+      "id": "wf02-node-001",
+      "name": "Webhook Lead Research",
+      "type": "n8n-nodes-base.webhook",
+      "position": [200, 300],
+      "parameters": {
+        "path": "lead-research",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": { "rawBody": false }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-002",
+      "name": "Verify Token",
+      "type": "n8n-nodes-base.function",
+      "position": [440, 300],
+      "parameters": {
+        "functionCode": "const headers = $input.first().json.headers || {};\nconst token   = headers['x-internal-token'] || headers['X-Internal-Token'];\n\nif (!token || token !== $env.INTERNAL_WEBHOOK_SECRET) {\n  throw new Error('UNAUTHORIZED_REQUEST: invalid or missing token');\n}\n\nreturn [{ json: $input.first().json }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-003",
+      "name": "Load Lead",
+      "type": "n8n-nodes-base.postgres",
+      "position": [680, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  l.id, l.email, l.email_domain,\n  l.first_name, l.last_name, l.full_name,\n  l.company, l.title, l.phone,\n  l.linkedin_url, l.website,\n  l.source, l.status, l.created_at\nFROM leads l\nWHERE l.id = $1\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $input.first().json.body?.lead_id || $input.first().json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-004",
+      "name": "Validate Lead Loaded",
+      "type": "n8n-nodes-base.function",
+      "position": [920, 300],
+      "parameters": {
+        "functionCode": "const items = $items('Load Lead');\n\nif (!items || items.length === 0) {\n  throw new Error('LEAD_NOT_FOUND: no lead matched the provided lead_id');\n}\n\nconst lead = items[0].json;\nif (!lead || !lead.id) {\n  throw new Error('LEAD_NOT_FOUND: lead record is empty');\n}\n\n// ── Fix: strip protocol before building Jina URL ──────────────────\n// Prevents: https://r.jina.ai/https://company.com\nconst raw = lead.website || `https://${lead.email_domain}`;\nconst scrapeTarget = raw.replace(/^https?:\\/\\//, '');\n\nreturn [{\n  json: {\n    ...lead,\n    scrape_target: scrapeTarget   // protocol-free, e.g. \"acme.com\"\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-005",
+      "name": "Check Research Lock",
+      "type": "n8n-nodes-base.redis",
+      "position": [1160, 300],
+      "parameters": {
+        "operation": "get",
+        "key": "={{ `research:lock:${$items('Validate Lead Loaded')[0].json.id}` }}"
+      },
+      "credentials": {
+        "redis": { "id": "redis-main", "name": "AZOX Redis" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-006",
+      "name": "Already Being Researched?",
+      "type": "n8n-nodes-base.if",
+      "position": [1400, 300],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $items('Check Research Lock')[0].json.value }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-007",
+      "name": "Return Already Processing",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1640, 160],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'skipped', message: 'Lead research already in progress' }) }}",
+        "options": { "responseCode": 200 }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-008",
+      "name": "Set Research Lock",
+      "type": "n8n-nodes-base.redis",
+      "position": [1640, 300],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `research:lock:${$items('Validate Lead Loaded')[0].json.id}` }}",
+        "value": "={{ $execution.id }}",
+        "expire": true,
+        "ttl": 600
+      },
+      "credentials": {
+        "redis": { "id": "redis-main", "name": "AZOX Redis" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-009",
+      "name": "Check Company Cache",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1880, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  id, domain, industry, sub_industry,\n  employee_count, annual_revenue, country, city,\n  company_type, tech_stack, funding_raised,\n  alexa_rank, linkedin_url, founded_year,\n  updated_at\nFROM companies\nWHERE domain = $1\n  AND updated_at > NOW() - INTERVAL '7 days'\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $items('Validate Lead Loaded')[0].json.email_domain ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-010",
+      "name": "Cache Hit?",
+      "type": "n8n-nodes-base.if",
+      "position": [2120, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $items('Check Company Cache').length > 0 }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-011",
+      "name": "ACK Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [2360, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'accepted', message: 'Lead research started', lead_id: $items('Validate Lead Loaded')[0].json.id }) }}",
+        "options": { "responseCode": 202 }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-012",
+      "name": "Clearbit Enrichment",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2600, 100],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ `https://person.clearbit.com/v2/combined/find?email=${encodeURIComponent($items('Validate Lead Loaded')[0].json.email)}` }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ `Bearer ${$env.CLEARBIT_API_KEY}` }}" }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "ignoreResponseCode": true,
+          "retry": {
+            "maxRetries": 2,
+            "retryOnFail": true,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-013",
+      "name": "Apollo Enrichment",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2600, 280],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apollo.io/v1/people/match",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "X-Api-Key",    "value": "={{ $env.APOLLO_API_KEY }}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "email",             "value": "={{ $items('Validate Lead Loaded')[0].json.email }}" },
+            { "name": "first_name",        "value": "={{ $items('Validate Lead Loaded')[0].json.first_name }}" },
+            { "name": "last_name",         "value": "={{ $items('Validate Lead Loaded')[0].json.last_name }}" },
+            { "name": "organization_name", "value": "={{ $items('Validate Lead Loaded')[0].json.company }}" }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "ignoreResponseCode": true,
+          "retry": {
+            "maxRetries": 2,
+            "retryOnFail": true,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-014",
+      "name": "Jina Website Scrape",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2600, 460],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ `https://r.jina.ai/${$items('Validate Lead Loaded')[0].json.scrape_target}` }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization",  "value": "={{ `Bearer ${$env.JINA_API_KEY}` }}" },
+            { "name": "Accept",         "value": "application/json" },
+            { "name": "X-Return-Format","value": "markdown" }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "ignoreResponseCode": true,
+          "retry": {
+            "maxRetries": 2,
+            "retryOnFail": true,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-015",
+      "name": "BuiltWith Tech Stack",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2600, 640],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ `https://api.builtwith.com/v21/api.json?KEY=${$env.BUILTWITH_API_KEY}&LOOKUP=${$items('Validate Lead Loaded')[0].json.email_domain}` }}",
+        "options": {
+          "timeout": 10000,
+          "ignoreResponseCode": true,
+          "retry": {
+            "maxRetries": 2,
+            "retryOnFail": true,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-016",
+      "name": "Merge Enrichment Results",
+      "type": "n8n-nodes-base.function",
+      "position": [2880, 380],
+      "parameters": {
+        "functionCode": "// ── Merge all enrichment API results ──────────────────────────────\n// Each branch may have succeeded or failed independently.\n// Partial failure is acceptable — we log gaps and continue.\n\nconst lead = $items('Validate Lead Loaded')[0].json;\n\n// ── Clearbit ──────────────────────────────────────────────────────\nlet clearbit = {};\ntry {\n  const cb = $items('Clearbit Enrichment')[0].json;\n  clearbit = {\n    bio:              cb?.person?.bio             || null,\n    location:         cb?.person?.location        || null,\n    twitter:          cb?.person?.twitter?.handle || null,\n    seniority:        cb?.person?.employment?.seniority || null,\n    employment_role:  cb?.person?.employment?.role || null,\n    company_domain:   cb?.company?.domain         || null,\n    company_type:     cb?.company?.type           || null,\n    company_size:     cb?.company?.metrics?.employees    || null,\n    company_revenue:  cb?.company?.metrics?.annualRevenue || null,\n    industry:         cb?.company?.category?.industry    || null,\n    sub_industry:     cb?.company?.category?.subIndustry || null,\n    company_country:  cb?.company?.geo?.country   || null,\n    company_city:     cb?.company?.geo?.city      || null,\n    technologies:     cb?.company?.tech           || [],\n    funding_raised:   cb?.company?.metrics?.raised || null,\n    alexa_rank:       cb?.company?.metrics?.alexaGlobalRank || null\n  };\n} catch(e) { clearbit = { error: 'clearbit_unavailable' }; }\n\n// ── Apollo ────────────────────────────────────────────────────────\nlet apollo = {};\ntry {\n  const ap = $items('Apollo Enrichment')[0].json?.person || {};\n  apollo = {\n    apollo_id:        ap.id                          || null,\n    headline:         ap.headline                    || null,\n    seniority:        ap.seniority                   || null,\n    departments:      ap.departments                 || [],\n    intent_strength:  ap.intent_strength             || null,\n    company_linkedin: ap.organization?.linkedin_url  || null,\n    company_founded:  ap.organization?.founded_year  || null,\n    keywords:         ap.organization?.keywords      || []\n  };\n} catch(e) { apollo = { error: 'apollo_unavailable' }; }\n\n// ── Jina Website Content ──────────────────────────────────────────\nlet jina = {};\ntry {\n  const ji = $items('Jina Website Scrape')[0].json;\n  const content = ji?.data?.content || ji?.content || '';\n  jina = {\n    website_title:   ji?.data?.title || null,\n    website_content: content.slice(0, 8000),   // raw cap — compressed below\n    scraped_url:     ji?.data?.url  || null\n  };\n} catch(e) { jina = { error: 'jina_unavailable' }; }\n\n// ── BuiltWith Tech Stack ──────────────────────────────────────────\nlet builtwith = {};\ntry {\n  const bw    = $items('BuiltWith Tech Stack')[0].json;\n  const paths = bw?.Results?.[0]?.Result?.Paths || [];\n  const techNames = [];\n  paths.forEach(p => {\n    (p.Technologies || []).forEach(t => { if (t.Name) techNames.push(t.Name); });\n  });\n  builtwith = {\n    technologies: [...new Set(techNames)],\n    tech_count:   techNames.length\n  };\n} catch(e) { builtwith = { error: 'builtwith_unavailable' }; }\n\n// ── Unified tech stack — deduplicated and CAPPED at 50 ────────────\n// BuiltWith can return hundreds of entries; large arrays bloat DB rows\nconst allTech = [\n  ...(Array.isArray(clearbit.technologies) ? clearbit.technologies : []),\n  ...(Array.isArray(builtwith.technologies) ? builtwith.technologies : [])\n];\nconst techStack = [...new Set(\n  allTech.map(t => typeof t === 'string' ? t : (t.name || t.tag || JSON.stringify(t)))\n)].slice(0, 50);   // hard cap\n\nreturn [{\n  json: {\n    lead_id:      lead.id,\n    email:        lead.email,\n    email_domain: lead.email_domain,\n    clearbit,\n    apollo,\n    jina,\n    builtwith,\n    tech_stack:   techStack,\n    enriched_at:  new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-017",
+      "name": "Compress for OpenAI",
+      "type": "n8n-nodes-base.function",
+      "position": [3120, 380],
+      "parameters": {
+        "functionCode": "// ── Token compression before OpenAI ───────────────────────────────\n// Reduces prompt size by ~40% — key for cost control at scale.\n//\n// Strategy:\n//   1. Collapse whitespace in website content\n//   2. Trim to 1200 chars (vs 2000 raw)\n//   3. Cap tech stack to 15 items for prompt (full 50 still in DB)\n//   4. Cap Apollo keywords to 10\n\nconst d = $input.first().json;\n\nconst rawContent = d.jina?.website_content || '';\nconst websiteSummary = rawContent\n  .replace(/<[^>]*>/g, '')        // strip any residual HTML tags\n  .replace(/\\s+/g, ' ')           // collapse whitespace\n  .replace(/https?:\\/\\/\\S+/g, '') // strip URLs\n  .trim()\n  .slice(0, 1200);\n\nconst techForPrompt   = (d.tech_stack   || []).slice(0, 15);\nconst keywordsForPrompt = (d.apollo?.keywords || []).slice(0, 10);\n\nreturn [{\n  json: {\n    ...d,\n    website_summary:    websiteSummary,\n    tech_for_prompt:    techForPrompt,\n    keywords_for_prompt: keywordsForPrompt\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-018",
+      "name": "Build Cached Enrichment",
+      "type": "n8n-nodes-base.function",
+      "position": [2360, 480],
+      "parameters": {
+        "functionCode": "// ── Cache Hit Path ─────────────────────────────────────────────────\n// Company was enriched within the last 7 days.\n// Re-use cached company data and skip all API calls.\n// We still need to generate a Lead Brief if one doesn't exist.\n\nconst lead    = $items('Validate Lead Loaded')[0].json;\nconst company = $items('Check Company Cache')[0].json;\n\nconst techStack = Array.isArray(company.tech_stack)\n  ? company.tech_stack\n  : (typeof company.tech_stack === 'string'\n      ? JSON.parse(company.tech_stack)\n      : []);\n\nreturn [{\n  json: {\n    lead_id:      lead.id,\n    email:        lead.email,\n    email_domain: lead.email_domain,\n    clearbit: {\n      industry:        company.industry,\n      sub_industry:    company.sub_industry,\n      company_size:    company.employee_count,\n      company_revenue: company.annual_revenue,\n      company_country: company.country,\n      company_city:    company.city,\n      company_type:    company.company_type,\n      funding_raised:  company.funding_raised,\n      alexa_rank:      company.alexa_rank\n    },\n    apollo: {\n      company_linkedin: company.linkedin_url,\n      company_founded:  company.founded_year,\n      keywords: []\n    },\n    jina:       { website_content: '', website_title: null },\n    builtwith:  { technologies: techStack },\n    tech_stack: techStack.slice(0, 50),\n    from_cache: true,\n    enriched_at: new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-019",
+      "name": "Compress Cached for OpenAI",
+      "type": "n8n-nodes-base.function",
+      "position": [2600, 480],
+      "parameters": {
+        "functionCode": "// Same compression step for cache-hit path\nconst d = $input.first().json;\n\nreturn [{\n  json: {\n    ...d,\n    website_summary:     '',\n    tech_for_prompt:     (d.tech_stack || []).slice(0, 15),\n    keywords_for_prompt: []\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-020",
+      "name": "Generate Lead Brief via OpenAI",
+      "type": "n8n-nodes-base.openAi",
+      "position": [3360, 400],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert B2B sales researcher. Produce a concise Lead Intelligence Brief for a sales agent. Be factual, structured, and commercially focused. Output valid JSON only — no markdown fences, no explanation, no preamble."
+            },
+            {
+              "role": "user",
+              "content": "={{ `Produce a Lead Intelligence Brief as a JSON object with exactly these keys:\n{\n  \"lead_summary\": \"2-3 sentence summary of who this person is\",\n  \"company_summary\": \"2-3 sentence summary of the company\",\n  \"icp_signals\": [\"signals suggesting ICP fit\"],\n  \"pain_points\": [\"likely pain points based on role, industry, tech stack\"],\n  \"conversation_hooks\": [\"2-3 specific personalised talking points\"],\n  \"recommended_approach\": \"brief outreach strategy recommendation\",\n  \"risk_flags\": [\"anything suggesting poor fit or risk\"]\n}\n\nLead:\nName: ${$items('Validate Lead Loaded')[0].json.full_name}\nTitle: ${$items('Validate Lead Loaded')[0].json.title || $json.clearbit?.employment_role || 'Unknown'}\nCompany: ${$items('Validate Lead Loaded')[0].json.company || $json.email_domain}\nIndustry: ${$json.clearbit?.industry || 'Unknown'}\nSize: ${$json.clearbit?.company_size || 'Unknown'} employees\nRevenue: ${$json.clearbit?.company_revenue || 'Unknown'}\nLocation: ${[$json.clearbit?.company_city, $json.clearbit?.company_country].filter(Boolean).join(', ') || 'Unknown'}\nSeniority: ${$json.clearbit?.seniority || $json.apollo?.seniority || 'Unknown'}\nTech Stack: ${($json.tech_for_prompt || []).join(', ') || 'Unknown'}\nWebsite: ${$json.website_summary || 'No website data'}\nKeywords: ${($json.keywords_for_prompt || []).join(', ') || 'None'}\nFunding: ${$json.clearbit?.funding_raised || 'Unknown'}` }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 1000
+        }
+      },
+      "credentials": {
+        "openAiApi": { "id": "openai-main", "name": "AZOX OpenAI" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-021",
+      "name": "Parse Brief JSON",
+      "type": "n8n-nodes-base.function",
+      "position": [3600, 400],
+      "parameters": {
+        "functionCode": "const raw = $input.first().json?.choices?.[0]?.message?.content\n         || $input.first().json?.message?.content\n         || '';\n\nlet brief = {};\ntry {\n  const cleaned = raw.replace(/```json|```/g, '').trim();\n  brief = JSON.parse(cleaned);\n} catch(e) {\n  brief = {\n    lead_summary:         raw.slice(0, 500),\n    company_summary:      null,\n    icp_signals:          [],\n    pain_points:          [],\n    conversation_hooks:   [],\n    recommended_approach: null,\n    risk_flags:           [],\n    parse_error:          e.message\n  };\n}\n\n// Pull lead_id from whichever enrichment path ran\nconst leadId = $items('Merge Enrichment Results')?.[0]?.json?.lead_id\n            || $items('Build Cached Enrichment')?.[0]?.json?.lead_id;\n\nconst enrichedAt = $items('Merge Enrichment Results')?.[0]?.json?.enriched_at\n                || $items('Build Cached Enrichment')?.[0]?.json?.enriched_at;\n\nreturn [{\n  json: {\n    lead_id:      leadId,\n    brief,\n    enriched_at:  enrichedAt,\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-022",
+      "name": "Upsert Company Record",
+      "type": "n8n-nodes-base.postgres",
+      "position": [3840, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO companies (\n  domain, name, industry, sub_industry,\n  employee_count, annual_revenue, country, city,\n  company_type, tech_stack, funding_raised,\n  alexa_rank, linkedin_url, founded_year,\n  raw_clearbit, raw_builtwith, updated_at\n) VALUES (\n  $1,  $2,  $3,  $4,\n  $5,  $6,  $7,  $8,\n  $9,  $10::jsonb, $11,\n  $12, $13, $14,\n  $15::jsonb, $16::jsonb, NOW()\n)\nON CONFLICT (domain) DO UPDATE SET\n  name           = EXCLUDED.name,\n  industry       = COALESCE(EXCLUDED.industry,       companies.industry),\n  sub_industry   = COALESCE(EXCLUDED.sub_industry,   companies.sub_industry),\n  employee_count = COALESCE(EXCLUDED.employee_count, companies.employee_count),\n  annual_revenue = COALESCE(EXCLUDED.annual_revenue, companies.annual_revenue),\n  country        = COALESCE(EXCLUDED.country,        companies.country),\n  city           = COALESCE(EXCLUDED.city,           companies.city),\n  tech_stack     = EXCLUDED.tech_stack,\n  funding_raised = COALESCE(EXCLUDED.funding_raised, companies.funding_raised),\n  alexa_rank     = COALESCE(EXCLUDED.alexa_rank,     companies.alexa_rank),\n  linkedin_url   = COALESCE(EXCLUDED.linkedin_url,   companies.linkedin_url),\n  raw_clearbit   = EXCLUDED.raw_clearbit,\n  raw_builtwith  = EXCLUDED.raw_builtwith,\n  updated_at     = NOW()\nRETURNING id, domain;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.email_domain,\n  $json.clearbit?.company_domain || $json.email_domain,\n  $json.clearbit?.industry       || null,\n  $json.clearbit?.sub_industry   || null,\n  $json.clearbit?.company_size   || null,\n  $json.clearbit?.company_revenue|| null,\n  $json.clearbit?.company_country|| null,\n  $json.clearbit?.company_city   || null,\n  $json.clearbit?.company_type   || null,\n  JSON.stringify($json.tech_stack),\n  $json.clearbit?.funding_raised || null,\n  $json.clearbit?.alexa_rank     || null,\n  $json.apollo?.company_linkedin || null,\n  $json.apollo?.company_founded  || null,\n  JSON.stringify($json.clearbit),\n  JSON.stringify($json.builtwith)\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-023",
+      "name": "Save Lead Brief",
+      "type": "n8n-nodes-base.postgres",
+      "position": [3840, 480],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO lead_briefs (\n  lead_id, brief, raw_enrichment, created_at\n) VALUES (\n  $1,\n  $2::jsonb,\n  $3::jsonb,\n  NOW()\n)\nON CONFLICT (lead_id) DO UPDATE SET\n  brief          = EXCLUDED.brief,\n  raw_enrichment = EXCLUDED.raw_enrichment,\n  updated_at     = NOW()\nRETURNING id, lead_id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify($json.brief),\n  JSON.stringify({\n    clearbit:    $items('Merge Enrichment Results')?.[0]?.json?.clearbit\n              || $items('Build Cached Enrichment')?.[0]?.json?.clearbit,\n    apollo:      $items('Merge Enrichment Results')?.[0]?.json?.apollo\n              || $items('Build Cached Enrichment')?.[0]?.json?.apollo,\n    tech_stack:  $items('Merge Enrichment Results')?.[0]?.json?.tech_stack\n              || $items('Build Cached Enrichment')?.[0]?.json?.tech_stack,\n    from_cache:  $items('Build Cached Enrichment')?.[0]?.json?.from_cache || false\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-024",
+      "name": "Update Lead with Company ID",
+      "type": "n8n-nodes-base.postgres",
+      "position": [4080, 380],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads\nSET\n  company_id = $1,\n  status     = 'researched',\n  updated_at = NOW()\nWHERE id = $2\nRETURNING id, status;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $items('Upsert Company Record')[0].json.id,\n  $json.lead_id\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-025",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [4320, 380],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES ('lead_researched', $1, $2::jsonb, NOW());",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify({\n    workflow:          'WF-02',\n    event:             'lead.enriched',\n    brief_id:          $items('Save Lead Brief')[0].json.id,\n    tech_stack_count:  ($items('Merge Enrichment Results')?.[0]?.json?.tech_stack\n                     || $items('Build Cached Enrichment')?.[0]?.json?.tech_stack || []).length,\n    from_cache:        $items('Build Cached Enrichment')?.[0]?.json?.from_cache || false,\n    sources:           ['clearbit','apollo','jina','builtwith'],\n    execution_id:      $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-026",
+      "name": "Emit lead.enriched Event",
+      "type": "n8n-nodes-base.postgres",
+      "position": [4560, 380],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'lead.enriched',\n  $1::jsonb,\n  NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  lead_id:      $json.lead_id,\n  brief_id:     $items('Save Lead Brief')[0].json.id,\n  execution_id: $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-027",
+      "name": "Release Research Lock",
+      "type": "n8n-nodes-base.redis",
+      "position": [4800, 380],
+      "parameters": {
+        "operation": "delete",
+        "key": "={{ `research:lock:${$json.lead_id}` }}"
+      },
+      "credentials": {
+        "redis": { "id": "redis-main", "name": "AZOX Redis" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-028",
+      "name": "Trigger WF-03 via HTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [5040, 380],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_BASE_URL }}/webhook/icp-scoring",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type",     "value": "application/json" },
+            { "name": "X-Internal-Token", "value": "={{ $env.INTERNAL_WEBHOOK_SECRET }}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "lead_id",  "value": "={{ $json.lead_id }}" },
+            { "name": "brief_id", "value": "={{ $items('Save Lead Brief')[0].json.id }}" },
+            { "name": "event",    "value": "lead.enriched" }
+          ]
+        },
+        "options": { "timeout": 5000, "ignoreResponseCode": true }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-029",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.function",
+      "position": [680, 520],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst msg = err.message || 'Unknown error in WF-02';\n\nconst isAuth     = msg.includes('UNAUTHORIZED_REQUEST');\nconst isNotFound = msg.includes('LEAD_NOT_FOUND');\n\nreturn [{\n  json: {\n    status:       isAuth ? 'unauthorized' : isNotFound ? 'not_found' : 'error',\n    message:      msg,\n    workflow:     'WF-02',\n    timestamp:    new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf02-node-030",
+      "name": "Return Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [920, 520],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($node['Handle Error'].json) }}",
+        "options": {
+          "responseCode": "={{ $node['Handle Error'].json.status === 'unauthorized' ? 401 : $node['Handle Error'].json.status === 'not_found' ? 404 : 500 }}"
+        }
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Webhook Lead Research": {
+      "main": [[{ "node": "Verify Token", "type": "main", "index": 0 }]]
+    },
+    "Verify Token": {
+      "main":  [[{ "node": "Load Lead", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Handle Error", "type": "main", "index": 0 }]]
+    },
+    "Load Lead": {
+      "main": [[{ "node": "Validate Lead Loaded", "type": "main", "index": 0 }]]
+    },
+    "Validate Lead Loaded": {
+      "main":  [[{ "node": "Check Research Lock", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Handle Error", "type": "main", "index": 0 }]]
+    },
+    "Check Research Lock": {
+      "main": [[{ "node": "Already Being Researched?", "type": "main", "index": 0 }]]
+    },
+    "Already Being Researched?": {
+      "main": [
+        [{ "node": "Return Already Processing", "type": "main", "index": 0 }],
+        [{ "node": "Set Research Lock",         "type": "main", "index": 0 }]
+      ]
+    },
+    "Set Research Lock": {
+      "main": [[{ "node": "Check Company Cache", "type": "main", "index": 0 }]]
+    },
+    "Check Company Cache": {
+      "main": [[{ "node": "Cache Hit?", "type": "main", "index": 0 }]]
+    },
+    "Cache Hit?": {
+      "main": [
+        [{ "node": "Build Cached Enrichment", "type": "main", "index": 0 }],
+        [{ "node": "ACK Webhook",             "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Cached Enrichment": {
+      "main": [[{ "node": "Compress Cached for OpenAI", "type": "main", "index": 0 }]]
+    },
+    "Compress Cached for OpenAI": {
+      "main": [[{ "node": "Generate Lead Brief via OpenAI", "type": "main", "index": 0 }]]
+    },
+    "ACK Webhook": {
+      "main": [[
+        { "node": "Clearbit Enrichment",  "type": "main", "index": 0 },
+        { "node": "Apollo Enrichment",    "type": "main", "index": 0 },
+        { "node": "Jina Website Scrape",  "type": "main", "index": 0 },
+        { "node": "BuiltWith Tech Stack", "type": "main", "index": 0 }
+      ]]
+    },
+    "Clearbit Enrichment":  { "main": [[{ "node": "Merge Enrichment Results", "type": "main", "index": 0 }]] },
+    "Apollo Enrichment":    { "main": [[{ "node": "Merge Enrichment Results", "type": "main", "index": 1 }]] },
+    "Jina Website Scrape":  { "main": [[{ "node": "Merge Enrichment Results", "type": "main", "index": 2 }]] },
+    "BuiltWith Tech Stack": { "main": [[{ "node": "Merge Enrichment Results", "type": "main", "index": 3 }]] },
+    "Merge Enrichment Results": {
+      "main": [[{ "node": "Compress for OpenAI", "type": "main", "index": 0 }]]
+    },
+    "Compress for OpenAI": {
+      "main": [[{ "node": "Generate Lead Brief via OpenAI", "type": "main", "index": 0 }]]
+    },
+    "Generate Lead Brief via OpenAI": {
+      "main": [[{ "node": "Parse Brief JSON", "type": "main", "index": 0 }]]
+    },
+    "Parse Brief JSON": {
+      "main": [[
+        { "node": "Upsert Company Record", "type": "main", "index": 0 },
+        { "node": "Save Lead Brief",       "type": "main", "index": 0 }
+      ]]
+    },
+    "Upsert Company Record": {
+      "main": [[{ "node": "Update Lead with Company ID", "type": "main", "index": 0 }]]
+    },
+    "Save Lead Brief": {
+      "main": [[{ "node": "Update Lead with Company ID", "type": "main", "index": 0 }]]
+    },
+    "Update Lead with Company ID": {
+      "main": [[{ "node": "Log Activity", "type": "main", "index": 0 }]]
+    },
+    "Log Activity": {
+      "main": [[{ "node": "Emit lead.enriched Event", "type": "main", "index": 0 }]]
+    },
+    "Emit lead.enriched Event": {
+      "main": [[{ "node": "Release Research Lock", "type": "main", "index": 0 }]]
+    },
+    "Release Research Lock": {
+      "main": [[{ "node": "Trigger WF-03 via HTTP", "type": "main", "index": 0 }]]
+    },
+    "Handle Error": {
+      "main": [[{ "node": "Return Error Response", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": ["azox", "agent-x", "lead-research", "v2"],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

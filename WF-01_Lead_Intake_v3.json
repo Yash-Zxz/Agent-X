@@ -1,0 +1,460 @@
+{
+  "name": "WF-01 Lead Intake",
+  "nodes": [
+    {
+      "id": "wf01-node-001",
+      "name": "Webhook Lead Intake",
+      "type": "n8n-nodes-base.webhook",
+      "position": [200, 300],
+      "parameters": {
+        "path": "lead-intake",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-002",
+      "name": "Verify Token",
+      "type": "n8n-nodes-base.function",
+      "position": [440, 300],
+      "parameters": {
+        "functionCode": "// ── Webhook Authentication ─────────────────────────────────────────\n// 1. Enforce POST-only to block GET/probe attempts\n// 2. Validate X-Internal-Token header against env secret\n\nconst incoming = $input.first().json;\nconst headers  = incoming.headers || {};\n\n// Method guard — n8n webhook nodes can receive other verbs if misconfigured\nconst method = incoming.method || incoming.httpMethod || 'POST';\nif (method.toUpperCase() !== 'POST') {\n  throw new Error('UNAUTHORIZED_REQUEST: invalid HTTP method');\n}\n\n// Token guard\nconst token = headers['x-internal-token'] || headers['X-Internal-Token'];\nif (!token) {\n  throw new Error('UNAUTHORIZED_REQUEST: missing x-internal-token header');\n}\nif (token !== $env.INTERNAL_WEBHOOK_SECRET) {\n  throw new Error('UNAUTHORIZED_REQUEST: invalid token');\n}\n\nreturn [{ json: incoming }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-003",
+      "name": "Rate Limit Check",
+      "type": "n8n-nodes-base.redis",
+      "position": [680, 300],
+      "parameters": {
+        "operation": "incr",
+        "key": "ratelimit:lead:webhook"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-004",
+      "name": "Set Rate Limit TTL + Enforce",
+      "type": "n8n-nodes-base.function",
+      "position": [920, 300],
+      "parameters": {
+        "functionCode": "// ── Rate Limit Enforcement ─────────────────────────────────────────\n// The Redis INCR node returns the new counter value in .value\n// On first hit (count === 1) we rely on WF-01's companion Redis Expire\n// node (wf01-node-005) to set the 60s window.\n// If count > 100 within that window, reject the request.\n\nconst count = $input.first().json.value ?? $input.first().json;\n\nif (Number(count) > 100) {\n  throw new Error('RATE_LIMIT_EXCEEDED: webhook limit is 100 requests/minute');\n}\n\n// Pass through the original payload (carried on $input)\nreturn [{ json: $input.first().json }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-005",
+      "name": "Set Rate Limit Window",
+      "type": "n8n-nodes-base.redis",
+      "position": [1160, 300],
+      "parameters": {
+        "operation": "expire",
+        "key": "ratelimit:lead:webhook",
+        "ttl": 60
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-006",
+      "name": "Normalize Lead",
+      "type": "n8n-nodes-base.function",
+      "position": [1400, 300],
+      "parameters": {
+        "functionCode": "// ── Normalize Lead Fields ──────────────────────────────────────────\nconst incoming = $input.first().json;\nconst body = incoming.body || incoming;\n\nfunction normalizeEmail(email) {\n  if (!email) return null;\n  return String(email).trim().toLowerCase();\n}\nfunction normalizeName(val) {\n  if (!val) return null;\n  return String(val).trim().replace(/\\s+/g, ' ');\n}\nfunction normalizePhone(val) {\n  if (!val) return null;\n  return String(val).replace(/[^\\d+\\-().\\s]/g, '').trim();\n}\nfunction normalizeSource(val) {\n  const allowed = [\n    'website','linkedin','referral','inbound',\n    'outbound','event','api','import','unknown'\n  ];\n  const src = val ? String(val).toLowerCase().trim() : 'unknown';\n  return allowed.includes(src) ? src : 'unknown';\n}\n\nconst normalized = {\n  email:        normalizeEmail(body.email),\n  first_name:   normalizeName(body.first_name  || body.firstName),\n  last_name:    normalizeName(body.last_name   || body.lastName),\n  full_name:    normalizeName(body.full_name   || body.name),\n  company:      normalizeName(body.company     || body.company_name),\n  title:        normalizeName(body.title       || body.job_title),\n  phone:        normalizePhone(body.phone),\n  linkedin_url: body.linkedin_url || body.linkedin || null,\n  website:      body.website || body.company_website || null,\n  source:       normalizeSource(body.source),\n  utm_campaign: body.utm_campaign || null,\n  utm_medium:   body.utm_medium  || null,\n  utm_source:   body.utm_source  || null,\n  raw_payload:  body,\n  ingested_at:  new Date().toISOString()\n};\n\nif (!normalized.full_name && normalized.first_name) {\n  normalized.full_name = [normalized.first_name, normalized.last_name]\n    .filter(Boolean).join(' ');\n}\n\nreturn [{ json: normalized }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-007",
+      "name": "Validate Email",
+      "type": "n8n-nodes-base.function",
+      "position": [1640, 300],
+      "parameters": {
+        "functionCode": "// ── Email Validation ───────────────────────────────────────────────\nconst data = $input.first().json;\n\nconst EMAIL_REGEX = /^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$/;\n\nconst DISPOSABLE_DOMAINS = [\n  'mailinator.com','guerrillamail.com','tempmail.com',\n  'throwaway.email','yopmail.com','maildrop.cc',\n  'trashmail.com','sharklasers.com','guerrillamailblock.com'\n];\n\nif (!data.email) {\n  throw new Error('VALIDATION_FAILED: email is required');\n}\nif (!EMAIL_REGEX.test(data.email)) {\n  throw new Error(`VALIDATION_FAILED: invalid email format → ${data.email}`);\n}\nif (!data.first_name && !data.full_name) {\n  throw new Error('VALIDATION_FAILED: first_name or full_name is required');\n}\n\n// Extract domain early — used in dedup query AND stored as DB column\nconst domain = data.email.split('@')[1]?.toLowerCase();\n\nif (DISPOSABLE_DOMAINS.includes(domain)) {\n  throw new Error(`VALIDATION_FAILED: disposable email domain → ${domain}`);\n}\n\nreturn [{\n  json: {\n    ...data,\n    email_domain: domain,\n    validation_passed: true\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-008",
+      "name": "Check Duplicate",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1880, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, email, status, created_at\nFROM leads\nWHERE email = $1\n   OR (\n     email_domain = $2\n     AND first_name ILIKE $3\n   )\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $node[\"Validate Email\"].json.email,\n  $node[\"Validate Email\"].json.email_domain,\n  $node[\"Validate Email\"].json.first_name || ''\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-009",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "position": [2120, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $items(\"Check Duplicate\").length > 0 }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-010",
+      "name": "Return Duplicate Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [2360, 160],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  status: 'duplicate',\n  message: 'Lead already exists',\n  lead_id: $items(\"Check Duplicate\")[0].json.id,\n  matched_email: $items(\"Check Duplicate\")[0].json.email\n}) }}",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-011",
+      "name": "Insert Lead",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2360, 440],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO leads (\n  email, email_domain,\n  first_name, last_name, full_name,\n  company, title, phone, linkedin_url,\n  website, source, utm_campaign, utm_medium,\n  utm_source, raw_payload, status, created_at\n) VALUES (\n  $1,  $2,\n  $3,  $4,  $5,\n  $6,  $7,  $8,  $9,\n  $10, $11, $12, $13,\n  $14, $15::jsonb, 'new', NOW()\n)\nRETURNING id, email, email_domain, created_at;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $node[\"Validate Email\"].json.email,\n  $node[\"Validate Email\"].json.email_domain,\n  $node[\"Validate Email\"].json.first_name,\n  $node[\"Validate Email\"].json.last_name,\n  $node[\"Validate Email\"].json.full_name,\n  $node[\"Validate Email\"].json.company,\n  $node[\"Validate Email\"].json.title,\n  $node[\"Validate Email\"].json.phone,\n  $node[\"Validate Email\"].json.linkedin_url,\n  $node[\"Validate Email\"].json.website,\n  $node[\"Validate Email\"].json.source,\n  $node[\"Validate Email\"].json.utm_campaign,\n  $node[\"Validate Email\"].json.utm_medium,\n  $node[\"Validate Email\"].json.utm_source,\n  JSON.stringify($node[\"Validate Email\"].json.raw_payload)\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-012",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2600, 440],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES (\n  'lead_created',\n  $1,\n  $2::jsonb,\n  NOW()\n);",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $items(\"Insert Lead\")[0].json.id,\n  JSON.stringify({\n    source:       $node[\"Validate Email\"].json.source,\n    workflow:     'WF-01',\n    event:        'lead.created',\n    email_domain: $items(\"Insert Lead\")[0].json.email_domain,\n    utm_campaign: $node[\"Validate Email\"].json.utm_campaign,\n    execution_id: $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-013",
+      "name": "Redis Lock",
+      "type": "n8n-nodes-base.redis",
+      "position": [2840, 440],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `lock:lead:${$items(\"Insert Lead\")[0].json.id}` }}",
+        "value": "processing",
+        "expire": true,
+        "ttl": 300
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-014",
+      "name": "Emit lead.created Event",
+      "type": "n8n-nodes-base.postgres",
+      "position": [3080, 440],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'lead.created',\n  $1::jsonb,\n  NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  lead_id:      $items(\"Insert Lead\")[0].json.id,\n  email:        $items(\"Insert Lead\")[0].json.email,\n  email_domain: $items(\"Insert Lead\")[0].json.email_domain,\n  source:       $node[\"Validate Email\"].json.source,\n  created_at:   $items(\"Insert Lead\")[0].json.created_at,\n  execution_id: $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-015",
+      "name": "Trigger WF-02 via HTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [3320, 440],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_BASE_URL }}/webhook/lead-research",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type",     "value": "application/json" },
+            { "name": "X-Internal-Token", "value": "={{ $env.INTERNAL_WEBHOOK_SECRET }}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "lead_id", "value": "={{ $items(\"Insert Lead\")[0].json.id }}" },
+            { "name": "event",   "value": "lead.created" }
+          ]
+        },
+        "options": {
+          "timeout": 5000,
+          "ignoreResponseCode": true
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-016",
+      "name": "Return Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [3560, 440],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  status:     'created',\n  message:    'Lead accepted and queued for enrichment',\n  lead_id:    $items(\"Insert Lead\")[0].json.id,\n  email:      $items(\"Insert Lead\")[0].json.email,\n  created_at: $items(\"Insert Lead\")[0].json.created_at\n}) }}",
+        "options": {
+          "responseCode": 201
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-017",
+      "name": "Handle Auth Error",
+      "type": "n8n-nodes-base.function",
+      "position": [440, 520],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst msg = err.message || 'Unauthorized';\nconst isRate = msg.includes('RATE_LIMIT_EXCEEDED');\n\nreturn [{\n  json: {\n    status:    isRate ? 'rate_limited' : 'unauthorized',\n    message:   isRate\n      ? 'Too many requests — limit is 100 per minute'\n      : 'Invalid or missing authentication token',\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-018",
+      "name": "Return 401 Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [680, 520],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($node[\"Handle Auth Error\"].json) }}",
+        "options": {
+          "responseCode": "={{ $node[\"Handle Auth Error\"].json.status === 'rate_limited' ? 429 : 401 }}"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-019",
+      "name": "Handle Validation Error",
+      "type": "n8n-nodes-base.function",
+      "position": [1640, 520],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst message = err.message || 'Unknown validation error';\nconst isValidation = message.includes('VALIDATION_FAILED');\n\nreturn [{\n  json: {\n    status:    isValidation ? 'rejected' : 'error',\n    message:   message.replace('VALIDATION_FAILED: ', ''),\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf01-node-020",
+      "name": "Return 422 Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1880, 520],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($node[\"Handle Validation Error\"].json) }}",
+        "options": {
+          "responseCode": 422
+        }
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Webhook Lead Intake": {
+      "main": [
+        [
+          { "node": "Verify Token", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Verify Token": {
+      "main": [
+        [
+          { "node": "Rate Limit Check", "type": "main", "index": 0 }
+        ]
+      ],
+      "error": [
+        [
+          { "node": "Handle Auth Error", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Rate Limit Check": {
+      "main": [
+        [
+          { "node": "Set Rate Limit TTL + Enforce", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Set Rate Limit TTL + Enforce": {
+      "main": [
+        [
+          { "node": "Set Rate Limit Window", "type": "main", "index": 0 }
+        ]
+      ],
+      "error": [
+        [
+          { "node": "Handle Auth Error", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Set Rate Limit Window": {
+      "main": [
+        [
+          { "node": "Normalize Lead", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Normalize Lead": {
+      "main": [
+        [
+          { "node": "Validate Email", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Validate Email": {
+      "main": [
+        [
+          { "node": "Check Duplicate", "type": "main", "index": 0 }
+        ]
+      ],
+      "error": [
+        [
+          { "node": "Handle Validation Error", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Check Duplicate": {
+      "main": [
+        [
+          { "node": "Is Duplicate?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [
+          { "node": "Return Duplicate Response", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Insert Lead", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Insert Lead": {
+      "main": [
+        [
+          { "node": "Log Activity", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Log Activity": {
+      "main": [
+        [
+          { "node": "Redis Lock", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Redis Lock": {
+      "main": [
+        [
+          { "node": "Emit lead.created Event", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Emit lead.created Event": {
+      "main": [
+        [
+          { "node": "Trigger WF-02 via HTTP", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Trigger WF-02 via HTTP": {
+      "main": [
+        [
+          { "node": "Return Success Response", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Handle Auth Error": {
+      "main": [
+        [
+          { "node": "Return 401 Response", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Handle Validation Error": {
+      "main": [
+        [
+          { "node": "Return 422 Response", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": ["azox", "agent-x", "lead-intake", "v3"],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

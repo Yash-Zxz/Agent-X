@@ -1,0 +1,441 @@
+{
+  "name": "WF-04 Outreach Generation",
+  "nodes": [
+    {
+      "id": "wf04-node-001",
+      "name": "Webhook Outreach Generation",
+      "type": "n8n-nodes-base.webhook",
+      "position": [200, 300],
+      "parameters": {
+        "path": "outreach-generation",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": { "rawBody": false }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-002",
+      "name": "Verify Token",
+      "type": "n8n-nodes-base.function",
+      "position": [440, 300],
+      "parameters": {
+        "functionCode": "const headers = $input.first().json.headers || {};\nconst token   = headers['x-internal-token'] || headers['X-Internal-Token'];\n\nif (!token || token !== $env.INTERNAL_WEBHOOK_SECRET) {\n  throw new Error('UNAUTHORIZED_REQUEST: invalid or missing token');\n}\n\nreturn [{ json: $input.first().json }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-003",
+      "name": "Load Lead Context",
+      "type": "n8n-nodes-base.postgres",
+      "position": [680, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  l.id                AS lead_id,\n  l.email,\n  l.email_domain,\n  l.first_name,\n  l.last_name,\n  l.full_name,\n  l.company,\n  l.title,\n  l.icp_score,\n  l.icp_tier,\n  l.score_breakdown,\n  l.source,\n  l.status            AS lead_status,\n  lb.brief            AS brief,\n  c.industry,\n  c.sub_industry,\n  c.employee_count,\n  c.annual_revenue,\n  c.country,\n  c.city,\n  c.tech_stack,\n  c.funding_raised,\n  cc.icp_config,\n  cc.sender_name,\n  cc.sender_title,\n  cc.company_name     AS client_company,\n  cc.value_proposition,\n  cc.tone,\n  cc.email_constraints\nFROM leads l\nLEFT JOIN lead_briefs   lb ON lb.lead_id   = l.id\nLEFT JOIN companies      c  ON c.id         = l.company_id\nLEFT JOIN client_configs cc ON cc.client_id = (\n  SELECT client_id FROM workers WHERE worker_type = 'agent-x' LIMIT 1\n)\nWHERE l.id = $1\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $input.first().json.body?.lead_id || $input.first().json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-004",
+      "name": "Load High-Performing Emails",
+      "type": "n8n-nodes-base.postgres",
+      "position": [920, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  se.subject,\n  se.body_text,\n  se.open_rate,\n  se.reply_rate,\n  se.tier\nFROM sequence_steps se\nJOIN sequences s ON s.id = se.sequence_id\nWHERE se.step_number = 1\n  AND se.reply_rate   > 0.05\n  AND se.open_rate    > 0.35\n  AND s.status        = 'active'\n  AND se.tier         = $1\nORDER BY se.reply_rate DESC\nLIMIT 3;",
+        "additionalFields": {
+          "queryParams": "={{ [ $input.first().json.body?.tier || $input.first().json.tier || 'B' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-005",
+      "name": "Validate Context",
+      "type": "n8n-nodes-base.function",
+      "position": [1160, 300],
+      "parameters": {
+        "functionCode": "const leadItems = $items('Load Lead Context');\nif (!leadItems || leadItems.length === 0) {\n  throw new Error('OUTREACH_FAILED: lead context not found');\n}\n\nconst lead = leadItems[0].json;\nif (!lead.lead_id) {\n  throw new Error('OUTREACH_FAILED: lead record is empty');\n}\n\nconst parseCol = (val) => {\n  if (!val) return null;\n  if (typeof val === 'object') return val;\n  try { return JSON.parse(val); } catch(e) { return null; }\n};\n\nconst brief            = parseCol(lead.brief)             || {};\nconst techStack        = parseCol(lead.tech_stack)        || [];\nconst scoreBreakdown   = parseCol(lead.score_breakdown)   || {};\nconst icpConfig        = parseCol(lead.icp_config)        || {};\nconst emailConstraints = parseCol(lead.email_constraints) || {};\n\nconst examples = ($items('Load High-Performing Emails') || [])\n  .map(i => i.json)\n  .filter(e => e.subject && e.body_text);\n\nconst toneMap   = { A: 'executive', B: 'consultative', C: 'educational' };\nconst tier      = lead.icp_tier || 'B';\nconst tone      = lead.tone || toneMap[tier] || 'consultative';\nconst wordLimitMap = { A: 120, B: 150, C: 180 };\nconst wordLimit = emailConstraints.max_words || wordLimitMap[tier] || 150;\n\nreturn [{\n  json: {\n    lead,\n    brief,\n    tech_stack: Array.isArray(techStack) ? techStack : [],\n    score_breakdown: scoreBreakdown,\n    icp_config: icpConfig,\n    email_constraints: emailConstraints,\n    examples,\n    tier,\n    tone,\n    word_limit: wordLimit,\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-006",
+      "name": "ACK Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1160, 480],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  status: 'accepted',\n  lead_id: $json.lead.lead_id,\n  tier: $json.tier\n}) }}",
+        "options": { "responseCode": 202 }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-007",
+      "name": "AI Strategy Planner",
+      "type": "n8n-nodes-base.openAi",
+      "position": [1400, 300],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a B2B sales strategist. Analyse the lead profile and choose the single most effective messaging angle for a cold email. Output ONLY valid JSON — no markdown, no preamble."
+            },
+            {
+              "role": "user",
+              "content": "={{ `Choose the best messaging strategy for this lead. Return a JSON object with exactly these keys:\n{\n  \"strategy\": \"one of: cost_reduction | automation | scaling | productivity | revenue_growth | hiring_support | risk_reduction | competitive_advantage\",\n  \"hook\": \"one specific opening hook sentence tailored to this lead (max 20 words)\",\n  \"pain_focus\": \"the single most likely pain point to address (max 15 words)\",\n  \"reasoning\": \"one sentence explaining why this angle was chosen\"\n}\n\nLead profile:\nName: ${$json.lead.first_name || $json.lead.full_name}\nTitle: ${$json.lead.title || 'Unknown'}\nCompany: ${$json.lead.company || $json.lead.email_domain}\nIndustry: ${$json.lead.industry || 'Unknown'}\nSize: ${$json.lead.employee_count || 'Unknown'} employees\nRevenue: ${$json.lead.annual_revenue || 'Unknown'}\nFunding: ${$json.lead.funding_raised || 'Unknown'}\nTech stack: ${($json.tech_stack || []).slice(0,8).join(', ') || 'Unknown'}\nICP signals: ${($json.brief.icp_signals || []).slice(0,3).join('; ') || 'none'}\nPain points from research: ${($json.brief.pain_points || []).slice(0,3).join('; ') || 'none'}\nCompany summary: ${($json.brief.company_summary || '').slice(0,200)}` }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.4,
+          "maxTokens": 300
+        }
+      },
+      "credentials": {
+        "openAiApi": { "id": "openai-main", "name": "AZOX OpenAI" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-008",
+      "name": "Parse Strategy",
+      "type": "n8n-nodes-base.function",
+      "position": [1640, 300],
+      "parameters": {
+        "functionCode": "// ── Parse AI Strategy response ─────────────────────────────────────\n// Fix 3: robust JSON extraction — strips any LLM preamble text\nconst raw = $input.first().json?.choices?.[0]?.message?.content\n         || $input.first().json?.message?.content\n         || '';\n\nlet strategy = {};\ntry {\n  // Find first { and last } to handle any preamble/postamble text\n  const start = raw.indexOf('{');\n  const end   = raw.lastIndexOf('}');\n  if (start === -1 || end === -1) throw new Error('no JSON object found');\n  strategy = JSON.parse(raw.slice(start, end + 1));\n} catch(e) {\n  // Graceful fallback — default strategy so email generation still runs\n  strategy = {\n    strategy:   'value_led',\n    hook:       'I came across your company and wanted to reach out',\n    pain_focus: 'operational efficiency',\n    reasoning:  'fallback — strategy parse failed: ' + e.message\n  };\n}\n\n// Pass through full upstream context + strategy\nconst ctx = $items('Validate Context')[0].json;\n\nreturn [{\n  json: {\n    ...ctx,\n    strategy\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-009",
+      "name": "Build Outreach Prompt",
+      "type": "n8n-nodes-base.function",
+      "position": [1880, 300],
+      "parameters": {
+        "functionCode": "// ── Build outreach prompt v2 ───────────────────────────────────────\n// Fix 1: safe() truncator prevents 2000+ token prompts at scale\n// Upgrade: injects strategy from AI Strategy Planner\n// Upgrade: requests subject_a + subject_b for A/B testing\n\nconst {\n  lead, brief, tech_stack, examples,\n  tone, word_limit, tier, strategy\n} = $input.first().json;\n\n// ── safe() — caps any text field injected into the prompt ─────────\nconst safe = (t, max = 300) => String(t || '').slice(0, max);\n\n// High-performing examples — each body capped at 300 chars\nlet examplesBlock = 'No examples yet — write from first principles.';\nif (examples.length > 0) {\n  examplesBlock = examples.map((e, i) =>\n    `Example ${i+1} (open: ${Math.round((e.open_rate||0)*100)}%, reply: ${Math.round((e.reply_rate||0)*100)}%):\\nSubject: ${safe(e.subject, 80)}\\nBody: ${safe(e.body_text, 300)}`\n  ).join('\\n\\n---\\n\\n');\n}\n\nconst techMentions   = tech_stack.slice(0, 8).join(', ') || 'not available';\nconst companySummary = safe(brief.company_summary, 300);\nconst icpSignals     = safe((brief.icp_signals  || []).slice(0,4).join('; '), 300) || 'none identified';\nconst painPoints     = safe((brief.pain_points  || []).slice(0,3).join('; '), 300) || 'none identified';\nconst hooks          = safe((brief.conversation_hooks || []).slice(0,2).join('; '), 200) || 'none available';\nconst approach       = safe(brief.recommended_approach, 200) || 'consultative value-led outreach';\n\n// Strategy fields — also safe()-capped\nconst strategyAngle = strategy?.strategy    || 'value_led';\nconst strategyHook  = safe(strategy?.hook,  150) || hooks;\nconst strategyFocus = safe(strategy?.pain_focus, 150) || painPoints;\n\nconst systemPrompt =\n  `You are an elite B2B sales email writer for a SaaS company.\\n` +\n  `Your emails are concise, personalised, and focused on ONE specific value proposition.\\n` +\n  `You never use generic openers like \"I hope this email finds you well\".\\n` +\n  `You never mention your company name in the subject line.\\n` +\n  `You always write in first person as the sender.\\n` +\n  `Output ONLY valid JSON — no markdown, no preamble, no text before or after the JSON object.`;\n\nconst userPrompt =\n  `Write a cold outreach email. Return a JSON object with EXACTLY these keys:\\n` +\n  `{\\n` +\n  `  \"subject_a\": \"variant A — direct/outcome-focused, max 9 words\",\\n` +\n  `  \"subject_b\": \"variant B — curiosity/insight-led, meaningfully different angle, max 9 words\",\\n` +\n  `  \"body\": \"full email body, plain text, no HTML\",\\n` +\n  `  \"preview_text\": \"preview snippet shown in inbox, max 90 chars\",\\n` +\n  `  \"personalisation_used\": [\"exact personalisation elements you actually included in the body\"],\\n` +\n  `  \"confidence\": 0.0-1.0,\\n` +\n  `  \"confidence_reason\": \"one sentence explaining the rating\"\\n` +\n  `}\\n\\n` +\n  `SENDER:\\n` +\n  `Name: ${lead.sender_name || 'Alex'}\\n` +\n  `Title: ${lead.sender_title || 'Account Executive'}\\n` +\n  `Company: ${lead.client_company || 'our company'}\\n` +\n  `Value proposition: ${lead.value_proposition || 'helping teams scale faster'}\\n\\n` +\n  `RECIPIENT:\\n` +\n  `Name: ${lead.first_name || lead.full_name || 'there'}\\n` +\n  `Title: ${lead.title || 'Unknown'}\\n` +\n  `Company: ${lead.company || lead.email_domain}\\n` +\n  `Industry: ${lead.industry || 'Unknown'}\\n` +\n  `Size: ${lead.employee_count || 'Unknown'} employees\\n` +\n  `Location: ${[lead.city, lead.country].filter(Boolean).join(', ') || 'Unknown'}\\n` +\n  `Funding: ${lead.funding_raised ? '$' + Number(lead.funding_raised).toLocaleString() : 'Unknown'}\\n` +\n  `Tech stack: ${techMentions}\\n` +\n  `Company context: ${companySummary}\\n\\n` +\n  `MESSAGING STRATEGY (follow this — chosen for this specific lead):\\n` +\n  `Angle: ${strategyAngle}\\n` +\n  `Opening hook: ${strategyHook}\\n` +\n  `Pain focus: ${strategyFocus}\\n\\n` +\n  `SUPPORTING INTEL:\\n` +\n  `ICP signals: ${icpSignals}\\n` +\n  `Pain points: ${painPoints}\\n` +\n  `Conversation hooks: ${hooks}\\n` +\n  `Recommended approach: ${approach}\\n\\n` +\n  `EMAIL REQUIREMENTS:\\n` +\n  `- Tone: ${tone}\\n` +\n  `- Max words: ${word_limit}\\n` +\n  `- Tier: ${tier} — ${tier==='A' ? 'executive, direct + outcome-focused' : tier==='B' ? 'manager, insight-led + clear question' : 'growth stage, educate + offer value'}\\n` +\n  `- First sentence MUST reference something specific about their company or role\\n` +\n  `- End with ONE clear low-friction CTA\\n` +\n  `- subject_a and subject_b must be meaningfully different angles\\n\\n` +\n  `HIGH-PERFORMING EXAMPLES (study structure only — do NOT copy wording):\\n` +\n  examplesBlock;\n\nreturn [{\n  json: {\n    ...$input.first().json,\n    system_prompt: systemPrompt,\n    user_prompt:   userPrompt\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-010",
+      "name": "Generate Email via OpenAI",
+      "type": "n8n-nodes-base.openAi",
+      "position": [2120, 300],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            { "role": "system", "content": "={{ $json.system_prompt }}" },
+            { "role": "user",   "content": "={{ $json.user_prompt }}"   }
+          ]
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 900
+        }
+      },
+      "credentials": {
+        "openAiApi": { "id": "openai-main", "name": "AZOX OpenAI" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-011",
+      "name": "Parse Generated Email",
+      "type": "n8n-nodes-base.function",
+      "position": [2360, 300],
+      "parameters": {
+        "functionCode": "// ── Parse OpenAI email response v2 ────────────────────────────────\n// Fix 3: robust JSON extraction handles LLM preamble/postamble text\n// Fix 5: parses subject_a + subject_b, picks active variant randomly\n\nconst raw = $input.first().json?.choices?.[0]?.message?.content\n         || $input.first().json?.message?.content\n         || '';\n\nlet parsed = {};\ntry {\n  // Robust extraction: find first { and last } — ignores any surrounding prose\n  const start = raw.indexOf('{');\n  const end   = raw.lastIndexOf('}');\n  if (start === -1 || end === -1) {\n    throw new Error('no JSON object found in response');\n  }\n  parsed = JSON.parse(raw.slice(start, end + 1));\n} catch(e) {\n  throw new Error(`PARSE_FAILED: ${e.message} | raw preview: ${raw.slice(0, 200)}`);\n}\n\nif (!parsed.body) {\n  throw new Error('PARSE_FAILED: OpenAI response missing body');\n}\nif (!parsed.subject_a && !parsed.subject_b) {\n  throw new Error('PARSE_FAILED: OpenAI response missing both subject variants');\n}\n\n// ── A/B test: randomly assign which subject variant is sent ────────\n// The other is stored for the learning loop in WF-11.\nconst useVariantA  = Math.random() < 0.5;\nconst activeSubject  = useVariantA ? (parsed.subject_a || parsed.subject_b) : (parsed.subject_b || parsed.subject_a);\nconst controlSubject = useVariantA ? parsed.subject_b : parsed.subject_a;\nconst activeVariant  = useVariantA ? 'A' : 'B';\n\nconst ctx       = $items('Validate Context')[0].json;\nconst wordCount = parsed.body.trim().split(/\\s+/).length;\n\nreturn [{\n  json: {\n    // Active email\n    subject:            activeSubject,\n    subject_variant:    activeVariant,\n    subject_a:          parsed.subject_a,\n    subject_b:          parsed.subject_b,\n    subject_control:    controlSubject,\n    body:               parsed.body,\n    preview_text:       parsed.preview_text || parsed.body.slice(0, 90),\n    personalisation_used: parsed.personalisation_used || [],\n    word_count:         wordCount,\n\n    // Confidence\n    confidence:         parseFloat(parsed.confidence) || 0.5,\n    confidence_reason:  parsed.confidence_reason || 'no reason provided',\n\n    // Strategy passthrough\n    strategy_used:      $items('Parse Strategy')[0].json.strategy?.strategy || 'unknown',\n\n    // Context\n    lead_id:      ctx.lead.lead_id,\n    email:        ctx.lead.email,\n    company:      ctx.lead.company || ctx.lead.email_domain,\n    tier:         ctx.tier,\n    tone:         ctx.tone,\n    word_limit:   ctx.word_limit,\n    pain_points:  ctx.brief.pain_points || [],\n    icp_signals:  ctx.brief.icp_signals || [],\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-012",
+      "name": "Confidence Gate",
+      "type": "n8n-nodes-base.if",
+      "position": [2600, 300],
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.confidence }}",
+              "operation": "largerEqual",
+              "value2": 0.65
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-013",
+      "name": "Guardrail Check",
+      "type": "n8n-nodes-base.function",
+      "position": [2840, 180],
+      "parameters": {
+        "functionCode": "// ── Email Guardrail Check v2 ───────────────────────────────────────\n// Fix 2: stronger personalisation check — validates body actually\n// contains lead-specific data, not just a non-empty array.\n\nconst {\n  subject, body, word_count, word_limit,\n  personalisation_used, lead_id, tier, company\n} = $input.first().json;\n\nconst violations  = [];\nconst bodyLower   = body.toLowerCase();\nconst subjectLow  = subject.toLowerCase();\n\n// 1. Generic opener\nif (/i hope this (email|message|finds you)/.test(bodyLower)) {\n  violations.push('generic_opener: \"I hope this...\" detected');\n}\n\n// 2. Placeholder leakage\nif (/\\[.*?\\]|\\{.*?\\}|<[A-Z_]+>|\\bUNKNOWN\\b|\\bNONE\\b/i.test(body)) {\n  violations.push('placeholder_leakage: unfilled template variable detected');\n}\n\n// 3. Word count\nif (word_count > word_limit * 1.2) {\n  violations.push(`word_count_exceeded: ${word_count} words vs limit ${word_limit}`);\n}\n\n// 4. Subject too short\nif (!subject || subject.trim().length < 3) {\n  violations.push('empty_subject: subject line too short');\n}\n\n// 5. Subject spam signals\nif (/^re:|^fwd:|\\bfree\\b|\\bguaranteed\\b|\\burgent\\b|!!!/.test(subjectLow)) {\n  violations.push('subject_spam_signal: spam trigger word in subject');\n}\n\n// 6. Competitor name leakage\nconst competitors = ($env.COMPETITOR_NAMES || '').split(',').filter(Boolean);\nif (competitors.some(c => bodyLower.includes(c.toLowerCase().trim()))) {\n  violations.push('competitor_mention: competitor name in body');\n}\n\n// 7. Legal risk\nif (/guaranteed roi|we promise|100% results|risk.?free guarantee/i.test(bodyLower)) {\n  violations.push('legal_risk: unsubstantiated guarantee language');\n}\n\n// 8. Fix 2: personalisation CONTENT check ─────────────────────────\n// Verify body actually contains the company name — not just that\n// personalisation_used array is non-empty (model can hallucinate that).\nconst companyName = (company || '').toLowerCase().replace(/[^a-z0-9]/g, '');\nconst bodyStripped = bodyLower.replace(/[^a-z0-9\\s]/g, '');\nif (companyName && companyName.length > 2 && !bodyStripped.includes(companyName)) {\n  violations.push(`missing_company_reference: body does not mention \"${company}\"`);\n}\n// Also fail if personalisation_used is entirely empty\nif (!personalisation_used || personalisation_used.length === 0) {\n  violations.push('no_personalisation: personalisation_used array is empty');\n}\n\n// 9. Multiple CTAs\nconst questionCount = (body.match(/\\?/g) || []).length;\nif (questionCount > 3) {\n  violations.push(`too_many_questions: ${questionCount} question marks detected`);\n}\n\nconst passed = violations.length === 0;\n\nreturn [{\n  json: {\n    ...$input.first().json,\n    guardrail_passed:     passed,\n    guardrail_violations: violations,\n    requires_escalation:  !passed\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-014",
+      "name": "Route on Guardrail",
+      "type": "n8n-nodes-base.if",
+      "position": [3080, 180],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.guardrail_passed }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-015",
+      "name": "Insert Sequence",
+      "type": "n8n-nodes-base.postgres",
+      "position": [3320, 80],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH new_seq AS (\n  INSERT INTO sequences (\n    lead_id, status, tier, created_at\n  ) VALUES (\n    $1, 'active', $2, NOW()\n  )\n  RETURNING id\n)\nINSERT INTO sequence_steps (\n  sequence_id, step_number, step_type,\n  subject, body_text, preview_text,\n  scheduled_at, status,\n  confidence, word_count,\n  personalisation_used,\n  subject_variant,\n  subject_a, subject_b,\n  strategy_used,\n  created_at\n) VALUES (\n  (SELECT id FROM new_seq),\n  1, 'email',\n  $3, $4, $5,\n  NOW() + INTERVAL '5 minutes',\n  'scheduled',\n  $6, $7,\n  $8::jsonb,\n  $9, $10, $11, $12,\n  NOW()\n)\nRETURNING id AS step_id, sequence_id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  $json.tier,\n  $json.subject,\n  $json.body,\n  $json.preview_text,\n  $json.confidence,\n  $json.word_count,\n  JSON.stringify($json.personalisation_used),\n  $json.subject_variant,\n  $json.subject_a,\n  $json.subject_b,\n  $json.strategy_used\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-016",
+      "name": "Update Lead Status",
+      "type": "n8n-nodes-base.postgres",
+      "position": [3560, 80],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads\nSET status = 'in_sequence', updated_at = NOW()\nWHERE id = $1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-017",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [3800, 80],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES ('email_generated', $1, $2::jsonb, NOW());",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify({\n    workflow:        'WF-04',\n    event:           'email.queued',\n    sequence_id:     $items('Insert Sequence')[0].json.sequence_id,\n    step_id:         $items('Insert Sequence')[0].json.step_id,\n    subject:         $json.subject,\n    subject_variant: $json.subject_variant,\n    strategy_used:   $json.strategy_used,\n    confidence:      $json.confidence,\n    word_count:      $json.word_count,\n    tier:            $json.tier,\n    execution_id:    $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-018",
+      "name": "Emit email.queued Event",
+      "type": "n8n-nodes-base.postgres",
+      "position": [4040, 80],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'email.queued',\n  $1::jsonb,\n  NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  lead_id:         $json.lead_id,\n  sequence_id:     $items('Insert Sequence')[0].json.sequence_id,\n  step_id:         $items('Insert Sequence')[0].json.step_id,\n  tier:            $json.tier,\n  subject_variant: $json.subject_variant,\n  strategy_used:   $json.strategy_used,\n  execution_id:    $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-019",
+      "name": "Escalate Low Confidence",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2840, 460],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (\n  lead_id, reason, context, status, created_at\n) VALUES (\n  $1, 'low_confidence_email', $2::jsonb, 'pending', NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify({\n    confidence:        $json.confidence,\n    confidence_reason: $json.confidence_reason,\n    subject_a:         $json.subject_a,\n    subject_b:         $json.subject_b,\n    body:              $json.body,\n    tier:              $json.tier,\n    strategy_used:     $json.strategy_used,\n    workflow:          'WF-04',\n    execution_id:      $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-020",
+      "name": "Escalate Guardrail Violation",
+      "type": "n8n-nodes-base.postgres",
+      "position": [3320, 380],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (\n  lead_id, reason, context, status, created_at\n) VALUES (\n  $1, 'guardrail_violation', $2::jsonb, 'pending', NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify({\n    violations:    $json.guardrail_violations,\n    subject_a:     $json.subject_a,\n    subject_b:     $json.subject_b,\n    body:          $json.body,\n    confidence:    $json.confidence,\n    strategy_used: $json.strategy_used,\n    tier:          $json.tier,\n    workflow:      'WF-04',\n    execution_id:  $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-021",
+      "name": "Notify Slack — Escalation",
+      "type": "n8n-nodes-base.slack",
+      "position": [3560, 420],
+      "parameters": {
+        "operation": "post",
+        "channel": "={{ $env.SLACK_ESCALATION_CHANNEL || '#agent-x-escalations' }}",
+        "text": "={{ `🚨 *WF-04 Escalation*\\n*Lead:* ${$items('Validate Context')[0].json.lead.email}  |  *Tier:* ${$items('Validate Context')[0].json.tier}\\n*Reason:* ${$json.reason || ($json.guardrail_violations||[]).join(', ')}\\n*Confidence:* ${Math.round(($items('Parse Generated Email')[0].json.confidence||0)*100)}%  |  *Strategy:* ${$items('Parse Generated Email')[0].json.strategy_used}\\n*Subject A:* ${$items('Parse Generated Email')[0].json.subject_a}\\n*Subject B:* ${$items('Parse Generated Email')[0].json.subject_b}\\n*Violations:* ${($json.guardrail_violations||[]).join(' | ')||'low confidence'}\\nReview: ${$env.N8N_WEBHOOK_BASE_URL}/escalations/${$json.id}` }}",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": { "id": "slack-main", "name": "AZOX Slack" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-022",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.function",
+      "position": [440, 520],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst msg = err.message || 'Unknown error in WF-04';\n\nconst isAuth   = msg.includes('UNAUTHORIZED_REQUEST');\nconst isFailed = msg.includes('OUTREACH_FAILED');\nconst isParse  = msg.includes('PARSE_FAILED');\n\nreturn [{\n  json: {\n    status:       isAuth ? 'unauthorized' : isFailed ? 'context_error' : isParse ? 'parse_error' : 'error',\n    message:      msg,\n    workflow:     'WF-04',\n    timestamp:    new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf04-node-023",
+      "name": "Return Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [680, 520],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($node['Handle Error'].json) }}",
+        "options": {
+          "responseCode": "={{ $node['Handle Error'].json.status === 'unauthorized' ? 401 : 500 }}"
+        }
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Webhook Outreach Generation": {
+      "main": [[{ "node": "Verify Token", "type": "main", "index": 0 }]]
+    },
+    "Verify Token": {
+      "main":  [[{ "node": "Load Lead Context", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Handle Error",      "type": "main", "index": 0 }]]
+    },
+    "Load Lead Context": {
+      "main": [[{ "node": "Load High-Performing Emails", "type": "main", "index": 0 }]]
+    },
+    "Load High-Performing Emails": {
+      "main": [[{ "node": "Validate Context", "type": "main", "index": 0 }]]
+    },
+    "Validate Context": {
+      "main": [[
+        { "node": "ACK Webhook",        "type": "main", "index": 0 },
+        { "node": "AI Strategy Planner","type": "main", "index": 0 }
+      ]],
+      "error": [[{ "node": "Handle Error", "type": "main", "index": 0 }]]
+    },
+    "AI Strategy Planner": {
+      "main":  [[{ "node": "Parse Strategy", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Handle Error",   "type": "main", "index": 0 }]]
+    },
+    "Parse Strategy": {
+      "main": [[{ "node": "Build Outreach Prompt", "type": "main", "index": 0 }]]
+    },
+    "Build Outreach Prompt": {
+      "main": [[{ "node": "Generate Email via OpenAI", "type": "main", "index": 0 }]]
+    },
+    "Generate Email via OpenAI": {
+      "main":  [[{ "node": "Parse Generated Email", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Handle Error",          "type": "main", "index": 0 }]]
+    },
+    "Parse Generated Email": {
+      "main":  [[{ "node": "Confidence Gate", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Handle Error",    "type": "main", "index": 0 }]]
+    },
+    "Confidence Gate": {
+      "main": [
+        [{ "node": "Guardrail Check",         "type": "main", "index": 0 }],
+        [{ "node": "Escalate Low Confidence", "type": "main", "index": 0 }]
+      ]
+    },
+    "Guardrail Check": {
+      "main": [[{ "node": "Route on Guardrail", "type": "main", "index": 0 }]]
+    },
+    "Route on Guardrail": {
+      "main": [
+        [{ "node": "Insert Sequence",             "type": "main", "index": 0 }],
+        [{ "node": "Escalate Guardrail Violation","type": "main", "index": 0 }]
+      ]
+    },
+    "Insert Sequence": {
+      "main": [[{ "node": "Update Lead Status", "type": "main", "index": 0 }]]
+    },
+    "Update Lead Status": {
+      "main": [[{ "node": "Log Activity", "type": "main", "index": 0 }]]
+    },
+    "Log Activity": {
+      "main": [[{ "node": "Emit email.queued Event", "type": "main", "index": 0 }]]
+    },
+    "Escalate Low Confidence": {
+      "main": [[{ "node": "Notify Slack — Escalation", "type": "main", "index": 0 }]]
+    },
+    "Escalate Guardrail Violation": {
+      "main": [[{ "node": "Notify Slack — Escalation", "type": "main", "index": 0 }]]
+    },
+    "Handle Error": {
+      "main": [[{ "node": "Return Error Response", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": ["azox", "agent-x", "outreach-generation", "v2"],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

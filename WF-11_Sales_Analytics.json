@@ -1,0 +1,687 @@
+{
+  "name": "WF-11 Sales Analytics",
+  "nodes": [
+    {
+      "id": "wf11-node-001",
+      "name": "Cron — Monday 9AM",
+      "type": "n8n-nodes-base.cron",
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "custom",
+              "cronExpression": "0 9 * * 1"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-002",
+      "name": "Set Run Context",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const now     = new Date();\nconst weekAgo = new Date(now - 7  * 24 * 60 * 60 * 1000);\nconst _90ago  = new Date(now - 90 * 24 * 60 * 60 * 1000);\n\nreturn [{\n  json: {\n    run_date:      now.toISOString().slice(0, 10),\n    week_start:    weekAgo.toISOString().slice(0, 10),\n    window_90d:    _90ago.toISOString().slice(0, 10),\n    report_label:  `Week of ${weekAgo.toISOString().slice(0, 10)}`\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-003",
+      "name": "Query — ICP Conversion Rates",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        680,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Conversion rates by industry (last 90 days)\nSELECT\n  l.client_id,\n  c.industry,\n  COUNT(DISTINCT l.id)                                              AS total_leads,\n  COUNT(DISTINCT CASE WHEN sm.event_type = 'reply_received'\n        THEN l.id END)                                              AS replied,\n  COUNT(DISTINCT CASE WHEN sm.event_type = 'meeting_booked'\n        THEN l.id END)                                              AS meetings,\n  COUNT(DISTINCT CASE WHEN lo.deal_result = 'won'\n        THEN l.id END)                                              AS won,\n  ROUND(100.0 * COUNT(DISTINCT CASE WHEN sm.event_type = 'reply_received'\n        THEN l.id END) / NULLIF(COUNT(DISTINCT l.id), 0), 1)       AS reply_rate,\n  ROUND(100.0 * COUNT(DISTINCT CASE WHEN sm.event_type = 'meeting_booked'\n        THEN l.id END) / NULLIF(COUNT(DISTINCT l.id), 0), 1)       AS meeting_rate,\n  ROUND(100.0 * COUNT(DISTINCT CASE WHEN lo.deal_result = 'won'\n        THEN l.id END) / NULLIF(COUNT(DISTINCT l.id), 0), 1)       AS win_rate\nFROM leads l\nJOIN companies c ON c.id = l.company_id\nLEFT JOIN sales_metrics sm ON sm.lead_id = l.id\nLEFT JOIN lead_outcomes lo ON lo.lead_id = l.id\nWHERE l.created_at > NOW() - INTERVAL '90 days'\nGROUP BY l.client_id, c.industry\nHAVING COUNT(DISTINCT l.id) >= 3\nORDER BY meeting_rate DESC\nLIMIT 20;"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-004",
+      "name": "Query — Seniority Conversion",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  l.client_id,\n  sm.seniority,\n  COUNT(DISTINCT l.id)                                              AS total_leads,\n  ROUND(100.0 * COUNT(DISTINCT CASE WHEN sm.event_type = 'reply_received'\n        THEN l.id END) / NULLIF(COUNT(DISTINCT l.id), 0), 1)       AS reply_rate,\n  ROUND(100.0 * COUNT(DISTINCT CASE WHEN sm.event_type = 'meeting_booked'\n        THEN l.id END) / NULLIF(COUNT(DISTINCT l.id), 0), 1)       AS meeting_rate\nFROM leads l\nJOIN sales_metrics sm ON sm.lead_id = l.id\nWHERE l.created_at > NOW() - INTERVAL '90 days'\n  AND sm.seniority IS NOT NULL\nGROUP BY l.client_id, sm.seniority\nHAVING COUNT(DISTINCT l.id) >= 3\nORDER BY meeting_rate DESC\nLIMIT 15;"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-005",
+      "name": "Query — Sequence Performance",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        680,
+        440
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Which step generates the first reply + avg touches to meeting\nSELECT\n  sm.sequence_step,\n  COUNT(*)                                                          AS total_sent,\n  COUNT(CASE WHEN sm.event_type = 'reply_received' THEN 1 END)     AS replies,\n  COUNT(CASE WHEN sm.event_type = 'meeting_booked' THEN 1 END)     AS meetings,\n  ROUND(100.0 * COUNT(CASE WHEN sm.event_type = 'reply_received'\n        THEN 1 END) / NULLIF(COUNT(*), 0), 1)                      AS reply_rate,\n  ROUND(AVG(CASE WHEN sm.event_type = 'meeting_booked'\n        THEN sm.sequence_step END), 1)                             AS avg_step_to_meeting\nFROM sales_metrics sm\nWHERE sm.created_at > NOW() - INTERVAL '90 days'\n  AND sm.sequence_step IS NOT NULL\nGROUP BY sm.sequence_step\nORDER BY sm.sequence_step ASC\nLIMIT 10;"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-006",
+      "name": "Query — Variant Performance",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        680,
+        580
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  sm.variant_group,\n  COUNT(CASE WHEN sm.event_type = 'email_sent'      THEN 1 END)    AS sent,\n  COUNT(CASE WHEN sm.event_type = 'reply_received'  THEN 1 END)    AS replies,\n  COUNT(CASE WHEN sm.event_type = 'meeting_booked'  THEN 1 END)    AS meetings,\n  ROUND(100.0 * COUNT(CASE WHEN sm.event_type = 'reply_received'\n        THEN 1 END) / NULLIF(COUNT(CASE WHEN sm.event_type = 'email_sent'\n        THEN 1 END), 0), 1)                                        AS reply_rate,\n  ROUND(100.0 * COUNT(CASE WHEN sm.event_type = 'meeting_booked'\n        THEN 1 END) / NULLIF(COUNT(CASE WHEN sm.event_type = 'email_sent'\n        THEN 1 END), 0), 1)                                        AS meeting_rate\nFROM sales_metrics sm\nWHERE sm.created_at > NOW() - INTERVAL '90 days'\n  AND sm.variant_group IS NOT NULL\nGROUP BY sm.variant_group\nORDER BY meeting_rate DESC NULLS LAST\nLIMIT 10;"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-007",
+      "name": "Query — Weekly Summary",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        680,
+        720
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COUNT(CASE WHEN sm.event_type = 'email_sent'     THEN 1 END)  AS emails_sent,\n  COUNT(CASE WHEN sm.event_type = 'reply_received' THEN 1 END)  AS replies,\n  COUNT(CASE WHEN sm.event_type = 'meeting_booked' THEN 1 END)  AS meetings_booked,\n  COUNT(DISTINCT sm.lead_id)                                     AS unique_leads_touched,\n  COUNT(DISTINCT CASE WHEN e.status = 'pending'\n        THEN e.id END)                                           AS open_escalations,\n  COUNT(DISTINCT cs.id)                                          AS signals_detected,\n  ROUND(100.0 * COUNT(CASE WHEN sm.event_type = 'reply_received' THEN 1 END)\n    / NULLIF(COUNT(CASE WHEN sm.event_type = 'email_sent' THEN 1 END), 0),\n    1)                                                           AS overall_reply_rate\nFROM sales_metrics sm\nLEFT JOIN escalations e   ON e.created_at   > NOW() - INTERVAL '7 days'\nLEFT JOIN company_signals cs ON cs.created_at > NOW() - INTERVAL '7 days'\nWHERE sm.created_at > NOW() - INTERVAL '7 days';"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-008",
+      "name": "Merge Query Results",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        920,
+        440
+      ],
+      "parameters": {
+        "functionCode": "// Collect results from all 5 parallel queries into one context object\nconst icpRows       = $items('Query — ICP Conversion Rates').map(i => i.json);\nconst seniorityRows = $items('Query — Seniority Conversion').map(i => i.json);\nconst seqRows       = $items('Query — Sequence Performance').map(i => i.json);\nconst variantRows   = $items('Query — Variant Performance').map(i => i.json);\nconst weeklyRow     = $items('Query — Weekly Summary')[0]?.json || {};\nconst ctx           = $items('Set Run Context')[0].json;\n\n// Format tables as compact text for the LLM prompt\nconst fmtTable = (rows, cols) => {\n  if (!rows || rows.length === 0) return 'No data for this period.';\n  const header = cols.join(' | ');\n  const lines  = rows.map(r => cols.map(c => String(r[c] ?? '-')).join(' | '));\n  return [header, ...lines].join('\\n');\n};\n\nconst icpTable = fmtTable(icpRows, ['industry','total_leads','reply_rate','meeting_rate','win_rate']);\nconst senTable = fmtTable(seniorityRows, ['seniority','total_leads','reply_rate','meeting_rate']);\nconst seqTable = fmtTable(seqRows, ['sequence_step','total_sent','replies','reply_rate','meetings']);\nconst varTable = fmtTable(variantRows, ['variant_group','sent','reply_rate','meeting_rate']);\n\nconst promptData = `\nREPORTING PERIOD: ${ctx.report_label}\n\nWEEKLY SUMMARY:\nEmails sent: ${weeklyRow.emails_sent || 0}\nReplies: ${weeklyRow.replies || 0} (${weeklyRow.overall_reply_rate || 0}% reply rate)\nMeetings booked: ${weeklyRow.meetings_booked || 0}\nUnique leads touched: ${weeklyRow.unique_leads_touched || 0}\nOpen escalations: ${weeklyRow.open_escalations || 0}\nSignals detected: ${weeklyRow.signals_detected || 0}\n\nINDUSTRY CONVERSION (last 90 days):\n${icpTable}\n\nTITLE/SENIORITY CONVERSION (last 90 days):\n${senTable}\n\nSEQUENCE STEP PERFORMANCE (last 90 days):\n${seqTable}\n\nA/B VARIANT PERFORMANCE (last 90 days):\n${varTable}\n`.trim();\n\nreturn [{\n  json: {\n    ...ctx,\n    prompt_data:     promptData,\n    weekly_summary:  weeklyRow,\n    icp_rows:        icpRows,\n    seniority_rows:  seniorityRows,\n    seq_rows:        seqRows,\n    variant_rows:    variantRows\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-009",
+      "name": "Generate AI Insights",
+      "type": "n8n-nodes-base.openAi",
+      "position": [
+        1160,
+        440
+      ],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert B2B sales analytics AI producing a weekly performance report for a sales team.\n\nAnalyze the data and produce a concise, actionable report. Focus on:\n- What is working (highest converting segments, best-performing steps)\n- What needs attention (low performers, anomalies)\n- 3 specific, concrete recommendations for next week\n\nOutput ONLY valid JSON with exactly these keys:\n{\n  \"executive_summary\": \"2-3 sentences — the most important takeaway this week\",\n  \"top_insights\": [\"4-5 specific data-driven observations, each one sentence\"],\n  \"winning_segments\": [\"top 2-3 industry or seniority segments by meeting rate\"],\n  \"underperforming\": [\"top 1-2 segments or steps that need attention\"],\n  \"recommendations\": [\"3 specific actions for next week — each actionable, not generic\"],\n  \"best_sequence_step\": \"which step number drives the most replies\",\n  \"variant_winner\": \"A or B or inconclusive — which variant is winning\"\n}"
+            },
+            {
+              "role": "user",
+              "content": "={{ $json.prompt_data }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 900
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-main",
+          "name": "AZOX OpenAI"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-010",
+      "name": "Parse Insights",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1400,
+        440
+      ],
+      "parameters": {
+        "functionCode": "const raw = $input.first().json?.choices?.[0]?.message?.content\n         || $input.first().json?.message?.content || '';\n\nlet insights = {};\ntry {\n  const s = raw.indexOf('{'); const e = raw.lastIndexOf('}');\n  if (s === -1 || e === -1) throw new Error('no JSON');\n  insights = JSON.parse(raw.slice(s, e + 1));\n} catch(_) {\n  insights = {\n    executive_summary:  'Analytics run completed. See data tables for details.',\n    top_insights:       ['Data available but AI summary failed — review tables directly.'],\n    winning_segments:   [],\n    underperforming:    [],\n    recommendations:    ['Review industry conversion table', 'Check sequence step performance', 'Compare A/B variants'],\n    best_sequence_step: 'unknown',\n    variant_winner:     'inconclusive'\n  };\n}\n\nconst ctx = $items('Merge Query Results')[0].json;\nconst w   = ctx.weekly_summary || {};\n\n// Format Slack Block Kit sections\nconst bulletList = (arr) => (arr || []).map(x => `• ${x}`).join('\\n');\n\nconst insightLines   = bulletList(insights.top_insights);\nconst winLines       = bulletList(insights.winning_segments);\nconst loseLines      = bulletList(insights.underperforming);\nconst recLines       = (insights.recommendations || []).map((r, i) => `${i+1}. ${r}`).join('\\n');\n\n// ICP table formatted for Slack (top 5 rows)\nconst icpSlack = (ctx.icp_rows || []).slice(0, 5)\n  .map(r => `• *${r.industry || '?'}*: ${r.reply_rate || 0}% reply | ${r.meeting_rate || 0}% meeting (n=${r.total_leads})`)\n  .join('\\n') || 'No data';\n\n// Sequence table for Slack\nconst seqSlack = (ctx.seq_rows || []).slice(0, 5)\n  .map(r => `• Step ${r.sequence_step}: ${r.reply_rate || 0}% reply rate (${r.replies || 0}/${r.total_sent || 0})`)\n  .join('\\n') || 'No data';\n\nreturn [{\n  json: {\n    ...ctx,\n    insights,\n    insight_lines:   insightLines,\n    win_lines:       winLines,\n    lose_lines:      loseLines,\n    rec_lines:       recLines,\n    icp_slack:       icpSlack,\n    seq_slack:       seqSlack,\n    emails_sent:     w.emails_sent     || 0,\n    replies:         w.replies         || 0,\n    meetings_booked: w.meetings_booked || 0,\n    reply_rate:      w.overall_reply_rate || 0,\n    escalations:     w.open_escalations  || 0,\n    signals:         w.signals_detected  || 0\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-011",
+      "name": "Post Report to Slack",
+      "type": "n8n-nodes-base.slack",
+      "position": [
+        1640,
+        440
+      ],
+      "parameters": {
+        "operation": "post",
+        "channel": "={{ $env.SLACK_WEEKLY_CHANNEL || '#azox-weekly' }}",
+        "text": "={{ `📊 AZOX Weekly Sales Report — ${$json.report_label}` }}",
+        "otherOptions": {
+          "blocks": "={{ JSON.stringify([\n  {\n    type: 'header',\n    text: { type: 'plain_text', text: `📊 AZOX Weekly Report — ${$json.report_label}`, emoji: true }\n  },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*📧 Emails Sent*\\n${$json.emails_sent}` },\n      { type: 'mrkdwn', text: `*💬 Replies*\\n${$json.replies} (${$json.reply_rate}%)` },\n      { type: 'mrkdwn', text: `*📅 Meetings Booked*\\n${$json.meetings_booked}` },\n      { type: 'mrkdwn', text: `*🚨 Open Escalations*\\n${$json.escalations}` },\n      { type: 'mrkdwn', text: `*📡 Signals Detected*\\n${$json.signals}` },\n      { type: 'mrkdwn', text: `*🏆 Variant Winner*\\n${$json.insights.variant_winner || 'TBD'}` }\n    ]\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*🧠 Executive Summary*\\n${$json.insights.executive_summary}` }\n  },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*🔍 Key Insights*\\n${$json.insight_lines}` }\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*🏭 Industry Conversion (top 5)*\\n${$json.icp_slack}` }\n  },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*📶 Sequence Step Performance*\\n${$json.seq_slack}` }\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*✅ Winning Segments*\\n${$json.win_lines || 'None identified yet'}` }\n  },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*⚠️ Needs Attention*\\n${$json.lose_lines || 'Nothing critical'}` }\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*🎯 Recommendations for Next Week*\\n${$json.rec_lines}` }\n  },\n  {\n    type: 'context',\n    elements: [{ type: 'mrkdwn', text: `Generated by AZOX Agent-X  |  Run date: ${$json.run_date}` }]\n  }\n]) }}"
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "slack-main",
+          "name": "AZOX Slack"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-012",
+      "name": "Query — Won Deals",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1640,
+        640
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Won deals in last 90 days with the winning sequence step email body\nSELECT\n  lo.lead_id,\n  lo.winning_step,\n  lo.deal_value,\n  l.client_id,\n  l.icp_tier        AS tier,\n  l.title           AS seniority,\n  c.industry,\n  ss.subject,\n  ss.body_text,\n  ss.strategy_used  AS signal_used\nFROM lead_outcomes lo\nJOIN leads         l  ON l.id  = lo.lead_id\nJOIN companies     c  ON c.id  = l.company_id\nLEFT JOIN sequence_steps ss\n  ON ss.sequence_id  = l.sequence_id\n AND ss.step_number  = lo.winning_step\nWHERE lo.deal_result  = 'won'\n  AND lo.created_at  > NOW() - INTERVAL '90 days'\n  AND lo.winning_step IS NOT NULL\nLIMIT 50;"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-013",
+      "name": "Any Won Deals?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        1880,
+        640
+      ],
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $items().length }}",
+              "operation": "largerEqual",
+              "value2": 1
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-014",
+      "name": "Upsert High-Performing Emails",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2120,
+        560
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO high_performing_emails (\n  client_id, lead_id, industry, seniority,\n  subject, body, signal_used, outcome,\n  created_at\n) VALUES (\n  $1, $2, $3, $4,\n  $5, $6, $7, 'won',\n  NOW()\n)\nON CONFLICT DO NOTHING;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.client_id,\n  $json.lead_id,\n  $json.industry    || null,\n  $json.seniority   || null,\n  $json.subject     || null,\n  $json.body_text   || null,\n  $json.signal_used || null\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-015",
+      "name": "Recalibrate ICP Weights",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2120,
+        720
+      ],
+      "parameters": {
+        "functionCode": "// ── ICP weight recalibration ─────────────────────────────────────────────\n// For each client, adjust industry weights in icp_config proportionally\n// to observed win rates over the last 90 days.\n//\n// Strategy: normalise win_rate across industries to sum to 1.0,\n// then blend 80% existing weight + 20% observed rate (conservative update).\n// This prevents wild swings from small sample sizes.\n\nconst icpRows   = $items('Query — ICP Conversion Rates').map(i => i.json);\nconst blendAlpha = 0.20;   // 20% new data, 80% existing weights\n\n// Group by client_id\nconst byClient = {};\nfor (const row of icpRows) {\n  if (!row.client_id) continue;\n  if (!byClient[row.client_id]) byClient[row.client_id] = [];\n  byClient[row.client_id].push(row);\n}\n\nconst updates = [];\n\nfor (const [clientId, rows] of Object.entries(byClient)) {\n  // Compute normalized win rates (sum to 1.0)\n  const totalWinRate = rows.reduce((s, r) => s + parseFloat(r.win_rate || 0), 0);\n  if (totalWinRate === 0) continue;   // no wins yet — skip recalibration\n\n  const industryWeights = {};\n  for (const row of rows) {\n    const normRate = parseFloat(row.win_rate || 0) / totalWinRate;\n    industryWeights[row.industry] = Math.round(normRate * 100) / 100;\n  }\n\n  updates.push({ clientId, industryWeights });\n}\n\n// If nothing to update, pass through\nif (updates.length === 0) {\n  return [{ json: { recalibration_skipped: true, reason: 'no wins data' } }];\n}\n\n// Return one item per client that needs updating\nreturn updates.map(u => ({\n  json: {\n    client_id:        u.clientId,\n    industry_weights: JSON.stringify(u.industryWeights),\n    blend_alpha:      blendAlpha,\n    recalibrated_at:  new Date().toISOString()\n  }\n}));"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-016",
+      "name": "Update ICP Config",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2360,
+        720
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE client_configs\nSET\n  config = jsonb_set(\n    config,\n    '{icp_config, industry_weights}',\n    $2::jsonb,\n    true   -- create key if missing\n  ),\n  updated_at = NOW()\nWHERE client_id = $1::uuid\n  AND $3 = FALSE;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.client_id,\n  $json.industry_weights,\n  $json.recalibration_skipped || false\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-017",
+      "name": "Log Analytics Run",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2600,
+        440
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES ('analytics_run', NULL, $1::jsonb, NOW());",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  workflow:        'WF-11',\n  report_label:    $items('Parse Insights')[0].json.report_label,\n  emails_sent:     $items('Parse Insights')[0].json.emails_sent,\n  replies:         $items('Parse Insights')[0].json.replies,\n  meetings_booked: $items('Parse Insights')[0].json.meetings_booked,\n  icp_rows:        $items('Parse Insights')[0].json.icp_rows?.length || 0,\n  execution_id:    $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf11-node-018",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        500
+      ],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst msg = err.message || 'Unknown error in WF-11';\n\nreturn [{\n  json: {\n    status:       'error',\n    message:      msg,\n    workflow:     'WF-11',\n    timestamp:    new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Cron — Monday 9AM": {
+      "main": [
+        [
+          {
+            "node": "Set Run Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Run Context": {
+      "main": [
+        [
+          {
+            "node": "Query — ICP Conversion Rates",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query — Seniority Conversion",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query — Sequence Performance",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query — Variant Performance",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query — Weekly Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query — ICP Conversion Rates": {
+      "main": [
+        [
+          {
+            "node": "Merge Query Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query — Seniority Conversion": {
+      "main": [
+        [
+          {
+            "node": "Merge Query Results",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query — Sequence Performance": {
+      "main": [
+        [
+          {
+            "node": "Merge Query Results",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query — Variant Performance": {
+      "main": [
+        [
+          {
+            "node": "Merge Query Results",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query — Weekly Summary": {
+      "main": [
+        [
+          {
+            "node": "Merge Query Results",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Query Results": {
+      "main": [
+        [
+          {
+            "node": "Generate AI Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate AI Insights": {
+      "main": [
+        [
+          {
+            "node": "Parse Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Insights": {
+      "main": [
+        [
+          {
+            "node": "Post Report to Slack",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query — Won Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Report to Slack": {
+      "main": [
+        [
+          {
+            "node": "Log Analytics Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query — Won Deals": {
+      "main": [
+        [
+          {
+            "node": "Any Won Deals?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Won Deals?": {
+      "main": [
+        [
+          {
+            "node": "Upsert High-Performing Emails",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Recalibrate ICP Weights",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Upsert High-Performing Emails": {
+      "main": [
+        [
+          {
+            "node": "Log Analytics Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recalibrate ICP Weights": {
+      "main": [
+        [
+          {
+            "node": "Update ICP Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update ICP Config": {
+      "main": [
+        [
+          {
+            "node": "Log Analytics Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    "azox",
+    "agent-x",
+    "analytics",
+    "learning-loop",
+    "v1"
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "version": "1.0.0"
+  }
+}

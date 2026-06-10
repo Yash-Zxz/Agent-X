@@ -1,0 +1,324 @@
+{
+  "name": "WF-03 ICP Scoring",
+  "nodes": [
+    {
+      "id": "wf03-node-001",
+      "name": "Webhook ICP Scoring",
+      "type": "n8n-nodes-base.webhook",
+      "position": [200, 300],
+      "parameters": {
+        "path": "icp-scoring",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": { "rawBody": false }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-002",
+      "name": "Verify Token",
+      "type": "n8n-nodes-base.function",
+      "position": [440, 300],
+      "parameters": {
+        "functionCode": "const headers = $input.first().json.headers || {};\nconst token   = headers['x-internal-token'] || headers['X-Internal-Token'];\n\nif (!token || token !== $env.INTERNAL_WEBHOOK_SECRET) {\n  throw new Error('UNAUTHORIZED_REQUEST: invalid or missing token');\n}\n\nreturn [{ json: $input.first().json }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-003",
+      "name": "Load Lead + Brief + Company",
+      "type": "n8n-nodes-base.postgres",
+      "position": [680, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  l.id                  AS lead_id,\n  l.email,\n  l.email_domain,\n  l.first_name,\n  l.last_name,\n  l.full_name,\n  l.company,\n  l.title,\n  l.source,\n  l.status              AS lead_status,\n  lb.brief              AS brief,\n  lb.raw_enrichment     AS raw_enrichment,\n  c.id                  AS company_id,\n  c.domain              AS company_domain,\n  c.industry,\n  c.sub_industry,\n  c.employee_count,\n  c.annual_revenue,\n  c.country,\n  c.city,\n  c.company_type,\n  c.tech_stack,\n  c.funding_raised\nFROM leads l\nLEFT JOIN lead_briefs lb ON lb.lead_id = l.id\nLEFT JOIN companies  c  ON c.id = l.company_id\nWHERE l.id = $1\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $input.first().json.body?.lead_id || $input.first().json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-004",
+      "name": "Load Client ICP Config",
+      "type": "n8n-nodes-base.postgres",
+      "position": [920, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  cc.id             AS config_id,\n  cc.client_id,\n  cc.icp_config,\n  cc.scoring_weights,\n  cc.tier_thresholds\nFROM client_configs cc\nJOIN workers w ON w.client_id = cc.client_id\nWHERE w.worker_type = 'agent-x'\nORDER BY cc.updated_at DESC\nLIMIT 1;",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-005",
+      "name": "Validate Inputs",
+      "type": "n8n-nodes-base.function",
+      "position": [1160, 300],
+      "parameters": {
+        "functionCode": "const lead   = $items('Load Lead + Brief + Company')[0]?.json;\nconst config = $items('Load Client ICP Config')[0]?.json;\n\nif (!lead || !lead.lead_id) {\n  throw new Error('SCORING_FAILED: lead not found');\n}\nif (!config || !config.icp_config) {\n  throw new Error('SCORING_FAILED: client ICP config missing');\n}\n\n// Parse JSONB columns if returned as strings\nconst parseCol = (val) => {\n  if (!val) return null;\n  if (typeof val === 'object') return val;\n  try { return JSON.parse(val); } catch(e) { return null; }\n};\n\nconst brief       = parseCol(lead.brief)       || {};\nconst rawEnrich   = parseCol(lead.raw_enrichment) || {};\nconst techStack   = parseCol(lead.tech_stack)  || [];\nconst icpConfig   = parseCol(config.icp_config);\nconst weights     = parseCol(config.scoring_weights) || {\n  industry:    25,\n  company_size: 20,\n  title_seniority: 25,\n  revenue_band:    20,\n  tech_stack:      10\n};\nconst tiers       = parseCol(config.tier_thresholds) || {\n  A: 75,\n  B: 50,\n  C: 0\n};\n\nreturn [{\n  json: {\n    lead,\n    brief,\n    raw_enrichment: rawEnrich,\n    tech_stack: Array.isArray(techStack) ? techStack : [],\n    icp_config: icpConfig,\n    weights,\n    tiers,\n    config_id: config.config_id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-006",
+      "name": "Compute ICP Score",
+      "type": "n8n-nodes-base.function",
+      "position": [1400, 300],
+      "parameters": {
+        "functionCode": "// ── ICP Scoring Engine v2 ──────────────────────────────────────────\n// Scores a lead 0-100 across 5 weighted dimensions.\n// Applies 3 bonus adjustments: intent signals, founder detection,\n// data completeness. Final score capped at 100.\n\nconst { lead, brief, tech_stack: rawTechStack, icp_config, weights, tiers } = $input.first().json;\n\nconst icp = icp_config || {};\n\n// ── Fix: SQL aliases company fields — map them explicitly ─────────\n// The JOIN returns c.industry AS industry, c.employee_count etc.\n// They land on `lead` since they're all in the same result row.\n// Alias them clearly so intent is obvious throughout.\nconst industry      = lead.industry      || null;   // from c.industry\nconst sub_industry  = lead.sub_industry  || null;   // from c.sub_industry\nconst employee_count = lead.employee_count || null; // from c.employee_count\nconst annual_revenue = lead.annual_revenue || null; // from c.annual_revenue\nconst title          = lead.title          || '';   // from l.title\n\n// ── Fix: tech_stack type guard ────────────────────────────────────\n// JSONB columns can occasionally arrive as strings; guard defensively.\nconst tech_stack = Array.isArray(rawTechStack)\n  ? rawTechStack\n  : (typeof rawTechStack === 'string'\n      ? (() => { try { return JSON.parse(rawTechStack); } catch(e) { return []; } })()\n      : []);\n\n// ── Helper: normalise weight object to sum to 1.0 ─────────────────\nfunction normaliseWeights(w) {\n  const total = Object.values(w).reduce((a, b) => a + Number(b), 0);\n  if (total === 0) return w;\n  return Object.fromEntries(Object.entries(w).map(([k, v]) => [k, Number(v) / total]));\n}\n\nconst W = normaliseWeights(weights);\n\nconst scoreBreakdown  = {};\nconst reasonBreakdown = {};\n\n// ── 1. INDUSTRY ────────────────────────────────────────────────────\n(function scoreIndustry() {\n  const target    = (icp.target_industries  || []).map(s => s.toLowerCase());\n  const exclude   = (icp.exclude_industries || []).map(s => s.toLowerCase());\n  const actual    = (industry     || '').toLowerCase();\n  const subActual = (sub_industry || '').toLowerCase();\n\n  if (!actual) {\n    scoreBreakdown.industry = 25;\n    reasonBreakdown.industry = 'unknown_industry';\n    return;\n  }\n  if (exclude.some(e => actual.includes(e))) {\n    scoreBreakdown.industry = 0;\n    reasonBreakdown.industry = `excluded:${actual}`;\n    return;\n  }\n  if (target.length === 0) {\n    scoreBreakdown.industry = 75;\n    reasonBreakdown.industry = 'no_filter_configured';\n    return;\n  }\n  if (target.some(t => actual.includes(t))) {\n    scoreBreakdown.industry = 100;\n    reasonBreakdown.industry = `matched:${actual}`;\n  } else if (target.some(t => subActual.includes(t))) {\n    scoreBreakdown.industry = 60;\n    reasonBreakdown.industry = `sub_industry_match:${subActual}`;\n  } else {\n    scoreBreakdown.industry = 0;\n    reasonBreakdown.industry = `no_match:${actual}`;\n  }\n})();\n\n// ── 2. COMPANY SIZE ────────────────────────────────────────────────\n(function scoreCompanySize() {\n  const targetBands = icp.target_employee_bands || [];\n  const count = parseInt(employee_count, 10);\n\n  if (isNaN(count)) {\n    scoreBreakdown.company_size = 30;\n    reasonBreakdown.company_size = 'unknown_employee_count';\n    return;\n  }\n  if (targetBands.length === 0) {\n    if      (count >= 50   && count <= 200)  scoreBreakdown.company_size = 100;\n    else if (count >= 201  && count <= 1000) scoreBreakdown.company_size = 85;\n    else if (count >= 1001 && count <= 5000) scoreBreakdown.company_size = 60;\n    else if (count >= 10   && count < 50)    scoreBreakdown.company_size = 50;\n    else if (count > 5000)                   scoreBreakdown.company_size = 30;\n    else                                     scoreBreakdown.company_size = 10;\n    reasonBreakdown.company_size = `default_band:${count}`;\n    return;\n  }\n  let best = 0;\n  for (const band of targetBands) {\n    if (count >= band.min && count <= band.max) best = Math.max(best, band.score || 100);\n  }\n  scoreBreakdown.company_size = best;\n  reasonBreakdown.company_size = `config_band:${count}`;\n})();\n\n// ── 3. TITLE SENIORITY ─────────────────────────────────────────────\n(function scoreSeniority() {\n  const titleLow  = title.toLowerCase();\n  const seniority = (\n    $input.first().json.raw_enrichment?.clearbit?.seniority || ''\n  ).toLowerCase();\n\n  const targetSeniority = (icp.target_seniority || []).map(s => s.toLowerCase());\n\n  // ── Upgrade 2: Founder detection ──────────────────────────────────\n  // Founders at startups often use non-standard titles.\n  // Detect them early and give full c_suite score before further logic.\n  if (/founder|co-founder|cofounder|owner/i.test(titleLow)) {\n    scoreBreakdown.title_seniority = 100;\n    reasonBreakdown.title_seniority = 'founder_detected';\n    return;\n  }\n\n  const C_SUITE    = ['ceo','cto','coo','cfo','cmo','chief','president'];\n  const VP_LEVEL   = ['vp','vice president','head of','director'];\n  const MANAGER    = ['manager','lead','principal','senior','staff'];\n  const INDIVIDUAL = ['engineer','analyst','developer','associate','specialist','coordinator'];\n\n  let detectedTier = 'unknown';\n  if      (C_SUITE.some(k    => titleLow.includes(k) || seniority.includes(k))) detectedTier = 'c_suite';\n  else if (VP_LEVEL.some(k   => titleLow.includes(k) || seniority.includes(k))) detectedTier = 'vp';\n  else if (MANAGER.some(k    => titleLow.includes(k) || seniority.includes(k))) detectedTier = 'manager';\n  else if (INDIVIDUAL.some(k => titleLow.includes(k)))                          detectedTier = 'individual';\n\n  const SENIORITY_SCORES = { c_suite: 100, vp: 85, manager: 65, individual: 25, unknown: 30 };\n\n  if (targetSeniority.length === 0) {\n    scoreBreakdown.title_seniority = SENIORITY_SCORES[detectedTier];\n    reasonBreakdown.title_seniority = `default:${detectedTier}`;\n    return;\n  }\n  if (targetSeniority.includes(detectedTier)) {\n    scoreBreakdown.title_seniority = 100;\n    reasonBreakdown.title_seniority = `target_match:${detectedTier}`;\n  } else {\n    const ORDER = ['c_suite','vp','manager','individual'];\n    const targetIdx   = Math.min(...targetSeniority.map(t => ORDER.indexOf(t)).filter(i => i >= 0));\n    const detectedIdx = ORDER.indexOf(detectedTier);\n    const gap = Math.abs(targetIdx - detectedIdx);\n    scoreBreakdown.title_seniority = gap === 1 ? 50 : gap === 2 ? 20 : 0;\n    reasonBreakdown.title_seniority = `gap_${gap}:${detectedTier}_vs_${targetSeniority.join('|')}`;\n  }\n})();\n\n// ── 4. REVENUE BAND ────────────────────────────────────────────────\n(function scoreRevenue() {\n  const targetBands = icp.target_revenue_bands || [];\n  const revenue = typeof annual_revenue === 'number'\n    ? annual_revenue\n    : parseInt(String(annual_revenue || '0').replace(/[^0-9]/g, ''), 10);\n\n  if (!revenue || isNaN(revenue)) {\n    scoreBreakdown.revenue_band = 30;\n    reasonBreakdown.revenue_band = 'unknown_revenue';\n    return;\n  }\n  if (targetBands.length === 0) {\n    if      (revenue >= 1e6  && revenue <= 1e7)  scoreBreakdown.revenue_band = 100;\n    else if (revenue >= 1e7  && revenue <= 5e7)  scoreBreakdown.revenue_band = 85;\n    else if (revenue >= 5e7  && revenue <= 2e8)  scoreBreakdown.revenue_band = 65;\n    else if (revenue >= 1e5  && revenue < 1e6)   scoreBreakdown.revenue_band = 40;\n    else if (revenue > 2e8)                       scoreBreakdown.revenue_band = 30;\n    else                                          scoreBreakdown.revenue_band = 10;\n    reasonBreakdown.revenue_band = `default_band:${revenue}`;\n    return;\n  }\n  let best = 0;\n  for (const band of targetBands) {\n    if (revenue >= band.min && revenue <= band.max) best = Math.max(best, band.score || 100);\n  }\n  scoreBreakdown.revenue_band = best;\n  reasonBreakdown.revenue_band = `config_band:${revenue}`;\n})();\n\n// ── 5. TECH STACK SIGNALS ──────────────────────────────────────────\n(function scoreTechStack() {\n  const targetTech  = (icp.target_technologies  || []).map(t => t.toLowerCase());\n  const bonusTech   = (icp.bonus_technologies   || []).map(t => t.toLowerCase());\n  const excludeTech = (icp.exclude_technologies || []).map(t => t.toLowerCase());\n\n  // ── Fix: type guard applied before .map() ─────────────────────────\n  const stack = Array.isArray(tech_stack)\n    ? tech_stack.map(t => String(t).toLowerCase())\n    : [];\n\n  if (targetTech.length === 0 && bonusTech.length === 0) {\n    scoreBreakdown.tech_stack = 50;\n    reasonBreakdown.tech_stack = 'no_tech_filter';\n    return;\n  }\n  if (excludeTech.some(ex => stack.includes(ex))) {\n    scoreBreakdown.tech_stack = 0;\n    reasonBreakdown.tech_stack = 'excluded_tech_detected';\n    return;\n  }\n  const matched    = targetTech.filter(t => stack.some(s => s.includes(t)));\n  const bonus      = bonusTech.filter(t  => stack.some(s => s.includes(t)));\n  const matchRatio = targetTech.length > 0 ? matched.length / targetTech.length : 1;\n  const baseScore  = Math.round(matchRatio * 80);\n  const bonusScore = Math.min(bonus.length * 10, 20);\n  scoreBreakdown.tech_stack = Math.min(baseScore + bonusScore, 100);\n  reasonBreakdown.tech_stack = `matched:${matched.join(',') || 'none'}|bonus:${bonus.join(',') || 'none'}`;\n})();\n\n// ── Weighted base score ────────────────────────────────────────────\nlet finalScore = Math.round(\n  (scoreBreakdown.industry        || 0) * W.industry +\n  (scoreBreakdown.company_size    || 0) * W.company_size +\n  (scoreBreakdown.title_seniority || 0) * W.title_seniority +\n  (scoreBreakdown.revenue_band    || 0) * W.revenue_band +\n  (scoreBreakdown.tech_stack      || 0) * W.tech_stack\n);\n\n// ── ICP signals and flags from AI brief ───────────────────────────\nconst icpSignals = brief.icp_signals || [];\nconst riskFlags  = brief.risk_flags  || [];\nconst painPoints = brief.pain_points || [];\n\n// ── Upgrade 1: AI intent signal boost (+5, max once) ──────────────\n// Buying signals detected in the AI brief lift the score.\n// Signals: hiring, expanding, recent funding, scaling, switching tools.\nconst INTENT_PATTERN = /hiring|expanding|funding|scaling|switching|growing|launched|raised/i;\nconst hasIntentSignal = icpSignals.some(s => INTENT_PATTERN.test(s))\n                     || (brief.company_summary || '').match(INTENT_PATTERN);\nif (hasIntentSignal) {\n  finalScore += 5;\n  reasonBreakdown.intent_boost = 'intent_signal_detected';\n}\n\n// ── Upgrade 3: Data completeness bonus (+5, max once) ─────────────\n// Reward leads where enrichment returned high-quality coverage.\n// Each present field = 1 point; 3/3 triggers the bonus.\nlet completeness = 0;\nif (employee_count && !isNaN(parseInt(employee_count, 10))) completeness += 1;\nif (annual_revenue && annual_revenue !== '0')                completeness += 1;\nif (tech_stack.length > 0)                                   completeness += 1;\nif (completeness >= 3) {\n  finalScore += 5;\n  reasonBreakdown.completeness_bonus = `all_3_fields_present`;\n}\n\n// ── Hard cap at 100 ───────────────────────────────────────────────\nfinalScore = Math.min(finalScore, 100);\n\n// ── Tier assignment ────────────────────────────────────────────────\nlet tier = 'C';\nif      (finalScore >= tiers.A) tier = 'A';\nelse if (finalScore >= tiers.B) tier = 'B';\n\n// ── Risk penalty: hard flags from AI brief (−15) ──────────────────\n// Re-evaluated after bonuses so a genuinely risky lead can't be\n// boosted into Tier A by intent signals alone.\nconst hasHardRisk = riskFlags.some(r =>\n  /budget|competitor|churned|bankrupt|acquired|shutdown|do not contact/i.test(r)\n);\nlet adjustedScore = hasHardRisk ? Math.max(finalScore - 15, 0) : finalScore;\n\nif (hasHardRisk) {\n  if      (adjustedScore >= tiers.A) tier = 'A';\n  else if (adjustedScore >= tiers.B) tier = 'B';\n  else                               tier = 'C';\n  reasonBreakdown.risk_penalty = 'hard_risk_flag_detected(-15)';\n}\n\nreturn [{\n  json: {\n    lead_id:          $input.first().json.lead.lead_id,\n    company_id:       $input.first().json.lead.company_id,\n    config_id:        $input.first().json.config_id,\n    score:            adjustedScore,\n    raw_score:        finalScore,\n    tier,\n    score_breakdown:  scoreBreakdown,\n    reason_breakdown: reasonBreakdown,\n    weights_used:     W,\n    icp_signals:      icpSignals,\n    risk_flags:       riskFlags,\n    pain_points:      painPoints,\n    has_hard_risk:    hasHardRisk,\n    has_intent_signal: !!hasIntentSignal,\n    data_completeness: completeness,\n    scored_at:        new Date().toISOString(),\n    execution_id:     $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-007",
+      "name": "ACK Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1640, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  status: 'accepted',\n  lead_id: $json.lead_id,\n  score: $json.score,\n  tier: $json.tier\n}) }}",
+        "options": { "responseCode": 202 }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-008",
+      "name": "Save Score to DB",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1880, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads\nSET\n  icp_score       = $1,\n  icp_tier        = $2,\n  score_breakdown = $3::jsonb,\n  status          = 'scored',\n  updated_at      = NOW()\nWHERE id = $4\nRETURNING id, icp_score, icp_tier, status;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.score,\n  $json.tier,\n  JSON.stringify({\n    breakdown: $json.score_breakdown,\n    reasons:   $json.reason_breakdown,\n    weights:   $json.weights_used,\n    risk_flags: $json.risk_flags,\n    icp_signals: $json.icp_signals\n  }),\n  $json.lead_id\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-009",
+      "name": "Insert Sales Metric",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2120, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sales_metrics (\n  lead_id, company_id, metric_type,\n  value, metadata, recorded_at\n) VALUES (\n  $1, $2, 'icp_score',\n  $3, $4::jsonb, NOW()\n);",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  $json.company_id,\n  $json.score,\n  JSON.stringify({\n    tier:       $json.tier,\n    raw_score:  $json.raw_score,\n    has_hard_risk: $json.has_hard_risk,\n    config_id:  $json.config_id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-010",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2360, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES ('lead_scored', $1, $2::jsonb, NOW());",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify({\n    workflow:     'WF-03',\n    event:        'lead.scored',\n    score:        $json.score,\n    tier:         $json.tier,\n    has_hard_risk: $json.has_hard_risk,\n    execution_id: $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-011",
+      "name": "Is Tier C (Disqualified)?",
+      "type": "n8n-nodes-base.if",
+      "position": [2600, 300],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.tier }}",
+              "operation": "equal",
+              "value2": "C"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-012",
+      "name": "Mark Lead Disqualified",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2840, 160],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads\nSET status = 'disqualified', updated_at = NOW()\nWHERE id = $1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-013",
+      "name": "Emit lead.disqualified Event",
+      "type": "n8n-nodes-base.postgres",
+      "position": [3080, 160],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'lead.disqualified',\n  $1::jsonb,\n  NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  lead_id:      $json.lead_id,\n  score:        $json.score,\n  tier:         $json.tier,\n  risk_flags:   $json.risk_flags,\n  execution_id: $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-014",
+      "name": "Emit lead.scored Event",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2840, 440],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'lead.scored',\n  $1::jsonb,\n  NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  lead_id:      $json.lead_id,\n  score:        $json.score,\n  tier:         $json.tier,\n  icp_signals:  $json.icp_signals,\n  pain_points:  $json.pain_points,\n  execution_id: $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-main", "name": "AZOX PostgreSQL" }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-015",
+      "name": "Trigger WF-04 via HTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [3080, 440],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_BASE_URL }}/webhook/outreach-generation",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type",     "value": "application/json" },
+            { "name": "X-Internal-Token", "value": "={{ $env.INTERNAL_WEBHOOK_SECRET }}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "lead_id", "value": "={{ $json.lead_id }}" },
+            { "name": "tier",    "value": "={{ $json.tier }}" },
+            { "name": "score",   "value": "={{ $json.score }}" },
+            { "name": "event",   "value": "lead.scored" }
+          ]
+        },
+        "options": { "timeout": 5000, "ignoreResponseCode": true }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-016",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.function",
+      "position": [440, 520],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst msg = err.message || 'Unknown error in WF-03';\n\nconst isAuth    = msg.includes('UNAUTHORIZED_REQUEST');\nconst isFailed  = msg.includes('SCORING_FAILED');\n\nreturn [{\n  json: {\n    status:       isAuth ? 'unauthorized' : isFailed ? 'scoring_failed' : 'error',\n    message:      msg,\n    workflow:     'WF-03',\n    timestamp:    new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf03-node-017",
+      "name": "Return Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [680, 520],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($node['Handle Error'].json) }}",
+        "options": {
+          "responseCode": "={{ $node['Handle Error'].json.status === 'unauthorized' ? 401 : 500 }}"
+        }
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Webhook ICP Scoring": {
+      "main": [[{ "node": "Verify Token", "type": "main", "index": 0 }]]
+    },
+    "Verify Token": {
+      "main":  [[{ "node": "Load Lead + Brief + Company", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Handle Error", "type": "main", "index": 0 }]]
+    },
+    "Load Lead + Brief + Company": {
+      "main": [[{ "node": "Load Client ICP Config", "type": "main", "index": 0 }]]
+    },
+    "Load Client ICP Config": {
+      "main": [[{ "node": "Validate Inputs", "type": "main", "index": 0 }]]
+    },
+    "Validate Inputs": {
+      "main":  [[{ "node": "Compute ICP Score", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Handle Error", "type": "main", "index": 0 }]]
+    },
+    "Compute ICP Score": {
+      "main": [[{ "node": "ACK Webhook", "type": "main", "index": 0 }]]
+    },
+    "ACK Webhook": {
+      "main": [[{ "node": "Save Score to DB", "type": "main", "index": 0 }]]
+    },
+    "Save Score to DB": {
+      "main": [[{ "node": "Insert Sales Metric", "type": "main", "index": 0 }]]
+    },
+    "Insert Sales Metric": {
+      "main": [[{ "node": "Log Activity", "type": "main", "index": 0 }]]
+    },
+    "Log Activity": {
+      "main": [[{ "node": "Is Tier C (Disqualified)?", "type": "main", "index": 0 }]]
+    },
+    "Is Tier C (Disqualified)?": {
+      "main": [
+        [{ "node": "Mark Lead Disqualified",    "type": "main", "index": 0 }],
+        [{ "node": "Emit lead.scored Event",    "type": "main", "index": 0 }]
+      ]
+    },
+    "Mark Lead Disqualified": {
+      "main": [[{ "node": "Emit lead.disqualified Event", "type": "main", "index": 0 }]]
+    },
+    "Emit lead.scored Event": {
+      "main": [[{ "node": "Trigger WF-04 via HTTP", "type": "main", "index": 0 }]]
+    },
+    "Handle Error": {
+      "main": [[{ "node": "Return Error Response", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": ["azox", "agent-x", "icp-scoring", "v1"],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

@@ -1,0 +1,1066 @@
+{
+  "name": "WF-08 CRM Sync",
+  "nodes": [
+    {
+      "id": "wf08-node-001",
+      "name": "Webhook CRM Sync",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "path": "crm-sync",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-002",
+      "name": "Verify Token",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const headers = $input.first().json.headers || {};\nconst token   = headers['x-internal-token'] || headers['X-Internal-Token'];\n\nif (!token || token !== $env.INTERNAL_WEBHOOK_SECRET) {\n  throw new Error('UNAUTHORIZED_REQUEST: invalid or missing token');\n}\n\nconst body = $input.first().json.body || $input.first().json;\nreturn [{ json: body }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-003",
+      "name": "ACK Immediately",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        440,
+        160
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"accepted\", \"message\": \"crm sync processing\" }",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-004",
+      "name": "Check Idempotency Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "operation": "get",
+        "key": "={{ `crm:sync:${$json.event}:${$json.lead_id}:${$json.step_id || $json.meeting_id || 'none'}` }}"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-005",
+      "name": "Already Synced?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        920,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.value }}",
+              "operation": "isEmpty"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-006",
+      "name": "Stop — Already Synced",
+      "type": "n8n-nodes-base.noOp",
+      "position": [
+        1160,
+        160
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-007",
+      "name": "Set Idempotency Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1160,
+        300
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `crm:sync:${$json.event}:${$json.lead_id}:${$json.step_id || $json.meeting_id || 'none'}` }}",
+        "value": "={{ new Date().toISOString() }}",
+        "expire": true,
+        "ttl": 86400
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-008",
+      "name": "Load Lead and Config",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  l.id              AS lead_id,\n  l.email,\n  l.first_name,\n  l.last_name,\n  l.full_name,\n  l.title,\n  l.company,\n  l.phone,\n  l.linkedin_url,\n  l.icp_tier        AS tier,\n  l.score,\n  l.status,\n  l.stage,\n  l.score_breakdown,\n  l.client_id,\n  l.sequence_id,\n  c.name            AS company_name,\n  c.website,\n  c.industry,\n  c.employee_count,\n  c.annual_revenue,\n  c.country,\n  cc.config         AS client_config,\n  cm.hubspot_contact_id,\n  cm.hubspot_deal_id,\n  cm.salesforce_contact_id,\n  cm.salesforce_opportunity_id\nFROM leads l\nLEFT JOIN companies    c  ON c.id  = l.company_id\nLEFT JOIN client_configs cc ON cc.client_id = l.client_id\nLEFT JOIN crm_mappings cm ON cm.lead_id = l.id\nWHERE l.id = $1\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-009",
+      "name": "Prepare CRM Context",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1640,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// ── Prepare unified context for CRM routing ─────────────────────────────\n// Merges trigger payload + DB lead record + client config.\n// Determines CRM provider and maps AZOX status to CRM stage.\n\nconst trigger = $items('Set Idempotency Key')[0].json;\nconst lead    = $input.first().json;\n\nif (!lead || !lead.lead_id) {\n  throw new Error(`LEAD_NOT_FOUND: ${trigger.lead_id}`);\n}\n\nconst parseCol = (v) => {\n  if (!v) return {};\n  if (typeof v === 'object') return v;\n  try { return JSON.parse(v); } catch(e) { return {}; }\n};\n\nconst clientConfig = parseCol(lead.client_config);\nconst crmConfig    = clientConfig.crm || {};\n\n// Determine which CRM to use (client config → env fallback)\nconst crmProvider = (crmConfig.provider || $env.DEFAULT_CRM_PROVIDER || 'hubspot').toLowerCase();\n\n// AZOX status → HubSpot deal stage internal value\n// Client can override via crm_config.stage_map\nconst defaultStageMap = {\n  new:              'appointmentscheduled',\n  scored:           'qualifiedtobuy',\n  in_sequence:      'presentationscheduled',\n  replied:          'decisionmakerboughtin',\n  meeting_proposed: 'contractsent',\n  meeting_booked:   'closedwon'\n};\nconst stageMap  = { ...defaultStageMap, ...(crmConfig.stage_map || {}) };\nconst dealStage = stageMap[lead.status] || stageMap['scored'];\n\n// HubSpot pipeline ID — default or client-specific\nconst pipelineId = crmConfig.hubspot_pipeline_id || $env.HUBSPOT_PIPELINE_ID || 'default';\n\n// Build the flat contact properties for HubSpot upsert\nconst hubspotContactProps = {\n  email:            lead.email,\n  firstname:        lead.first_name || '',\n  lastname:         lead.last_name  || '',\n  jobtitle:         lead.title      || '',\n  company:          lead.company    || '',\n  phone:            lead.phone      || '',\n  website:          lead.website    || '',\n  hs_lead_status:   lead.status,\n  // Custom AZOX properties\n  azox_lead_id:     lead.lead_id,\n  azox_score:       String(lead.score || 0),\n  azox_tier:        lead.tier        || '',\n  azox_status:      lead.status      || '',\n  azox_last_action: trigger.event    || '',\n  azox_meeting_booked: trigger.event === 'meeting.booked' ? 'true' : undefined\n};\n\n// Remove undefined values\nObject.keys(hubspotContactProps).forEach(k => {\n  if (hubspotContactProps[k] === undefined) delete hubspotContactProps[k];\n});\n\n// Deal properties\nconst hubspotDealProps = {\n  dealname:    `${lead.company || ''} — ${lead.full_name || lead.email}`,\n  amount:      String(lead.annual_revenue || ''),\n  dealstage:   dealStage,\n  pipeline:    pipelineId,\n  closedate:   new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),\n  azox_lead_id: lead.lead_id\n};\n\nreturn [{\n  json: {\n    ...lead,\n    ...trigger,\n    lead_id:                lead.lead_id,\n    crm_provider:           crmProvider,\n    deal_stage:             dealStage,\n    pipeline_id:            pipelineId,\n    hubspot_contact_id:     lead.hubspot_contact_id     || null,\n    hubspot_deal_id:        lead.hubspot_deal_id         || null,\n    salesforce_contact_id:  lead.salesforce_contact_id  || null,\n    salesforce_opp_id:      lead.salesforce_opportunity_id || null,\n    hubspot_contact_props:  hubspotContactProps,\n    hubspot_deal_props:     hubspotDealProps,\n    client_config:          clientConfig,\n    crm_config:             crmConfig,\n    prepared_at:            new Date().toISOString()\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-010",
+      "name": "Route by CRM Provider",
+      "type": "n8n-nodes-base.switch",
+      "position": [
+        1880,
+        300
+      ],
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.crm_provider }}",
+        "rules": {
+          "rules": [
+            {
+              "value2": "hubspot",
+              "output": 0
+            },
+            {
+              "value2": "salesforce",
+              "output": 1
+            }
+          ]
+        },
+        "fallbackOutput": 0
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-011",
+      "name": "HubSpot — Upsert Contact",
+      "type": "n8n-nodes-base.hubspot",
+      "position": [
+        2120,
+        180
+      ],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{ $json.email }}",
+        "additionalFields": {
+          "customPropertiesUi": {
+            "customPropertiesValues": [
+              {
+                "property": "firstname",
+                "value": "={{ $json.hubspot_contact_props.firstname }}"
+              },
+              {
+                "property": "lastname",
+                "value": "={{ $json.hubspot_contact_props.lastname }}"
+              },
+              {
+                "property": "jobtitle",
+                "value": "={{ $json.hubspot_contact_props.jobtitle }}"
+              },
+              {
+                "property": "company",
+                "value": "={{ $json.hubspot_contact_props.company }}"
+              },
+              {
+                "property": "phone",
+                "value": "={{ $json.hubspot_contact_props.phone }}"
+              },
+              {
+                "property": "website",
+                "value": "={{ $json.hubspot_contact_props.website }}"
+              },
+              {
+                "property": "hs_lead_status",
+                "value": "={{ $json.hubspot_contact_props.hs_lead_status }}"
+              },
+              {
+                "property": "azox_lead_id",
+                "value": "={{ $json.hubspot_contact_props.azox_lead_id }}"
+              },
+              {
+                "property": "azox_score",
+                "value": "={{ $json.hubspot_contact_props.azox_score }}"
+              },
+              {
+                "property": "azox_tier",
+                "value": "={{ $json.hubspot_contact_props.azox_tier }}"
+              },
+              {
+                "property": "azox_status",
+                "value": "={{ $json.hubspot_contact_props.azox_status }}"
+              },
+              {
+                "property": "azox_last_action",
+                "value": "={{ $json.hubspot_contact_props.azox_last_action }}"
+              }
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "hubspotApi": {
+          "id": "hubspot-main",
+          "name": "AZOX HubSpot"
+        }
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "wf08-node-012",
+      "name": "HubSpot — Upsert Deal",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2360,
+        180
+      ],
+      "parameters": {
+        "functionCode": "\n// ── HubSpot 429-aware HTTP wrapper ───────────────────────────────────────\n// Retries on 429 Too Many Requests (HubSpot: 100 req / 10 sec).\n// Respects Retry-After header if present; falls back to 2s → 4s → 8s.\n// Max 3 retries. Throws on 4th failure or non-429 error.\nconst hsRequest = async (opts, attempt = 0) => {\n  try {\n    return await $helpers.httpRequest(opts);\n  } catch (err) {\n    const status = err.response?.statusCode || err.statusCode || 0;\n    if (status === 429 && attempt < 3) {\n      const retryAfterMs =\n        parseInt(err.response?.headers?.['retry-after'] || '0', 10) * 1000\n        || (2 ** attempt) * 2000;   // 2s, 4s, 8s\n      await new Promise(r => setTimeout(r, retryAfterMs));\n      return hsRequest(opts, attempt + 1);\n    }\n    throw err;   // re-throw if not 429 or out of retries\n  }\n};\n\n// ── HubSpot Deal Upsert via REST API ─────────────────────────────────────\n// Uses hsRequest (429-aware) for all HubSpot calls.\n// Logic:\n//   1. Search deals by azox_lead_id custom property\n//   2. If found → PATCH to update stage\n//   3. If not found → POST to create + associate with contact\n\nconst ctx   = $input.first().json;\nconst token = $env.HUBSPOT_API_KEY;\n\nconst headers = {\n  'Authorization': `Bearer ${token}`,\n  'Content-Type':  'application/json'\n};\n\nconst contactId = ctx.vid || ctx.id ||\n  $items('HubSpot — Upsert Contact')[0].json.vid ||\n  $items('HubSpot — Upsert Contact')[0].json.id;\n\n// ── Step 1: Search for existing deal ─────────────────────────────────────\nconst searchResp = await hsRequest({\n  method:  'POST',\n  url:     'https://api.hubapi.com/crm/v3/objects/deals/search',\n  headers,\n  body: JSON.stringify({\n    filterGroups: [{\n      filters: [{\n        propertyName: 'azox_lead_id',\n        operator:     'EQ',\n        value:        ctx.lead_id\n      }]\n    }],\n    properties: ['dealname', 'dealstage', 'pipeline', 'azox_lead_id'],\n    limit: 1\n  })\n});\n\nconst searchResult   = typeof searchResp === 'string' ? JSON.parse(searchResp) : searchResp;\nconst existingDeal   = searchResult.results?.[0];\nconst existingDealId = existingDeal?.id || ctx.hubspot_deal_id || null;\n\nlet dealId;\nlet dealAction;\n\nif (existingDealId) {\n  // ── Update existing deal ──────────────────────────────────────────────\n  const updateResp = await hsRequest({\n    method:  'PATCH',\n    url:     `https://api.hubapi.com/crm/v3/objects/deals/${existingDealId}`,\n    headers,\n    body: JSON.stringify({\n      properties: {\n        dealstage:        ctx.deal_stage,\n        azox_status:      ctx.status,\n        azox_last_action: ctx.event\n      }\n    })\n  });\n  const updated = typeof updateResp === 'string' ? JSON.parse(updateResp) : updateResp;\n  dealId     = updated.id || existingDealId;\n  dealAction = 'updated';\n\n} else {\n  // ── Create new deal ───────────────────────────────────────────────────\n  const createResp = await hsRequest({\n    method:  'POST',\n    url:     'https://api.hubapi.com/crm/v3/objects/deals',\n    headers,\n    body: JSON.stringify({\n      properties: {\n        dealname:         ctx.hubspot_deal_props.dealname,\n        amount:           ctx.hubspot_deal_props.amount,\n        dealstage:        ctx.deal_stage,\n        pipeline:         ctx.pipeline_id,\n        closedate:        ctx.hubspot_deal_props.closedate,\n        azox_lead_id:     ctx.lead_id,\n        azox_status:      ctx.status,\n        azox_tier:        ctx.tier,\n        azox_last_action: ctx.event\n      },\n      associations: contactId ? [{\n        to:    { id: String(contactId) },\n        types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 3 }]\n      }] : []\n    })\n  });\n  const created = typeof createResp === 'string' ? JSON.parse(createResp) : createResp;\n  dealId     = created.id;\n  dealAction = 'created';\n\n  // Associate deal ↔ contact (non-fatal if already exists)\n  if (contactId && dealId) {\n    await hsRequest({\n      method:  'PUT',\n      url:     `https://api.hubapi.com/crm/v3/objects/deals/${dealId}/associations/contacts/${contactId}/deal_to_contact`,\n      headers,\n      body:    JSON.stringify({})\n    }).catch(() => {});\n  }\n}\n\nreturn [{\n  json: {\n    ...ctx,\n    hubspot_contact_id_resolved: String(contactId || ''),\n    hubspot_deal_id_resolved:    String(dealId    || ''),\n    hubspot_deal_action:         dealAction\n  }\n}];\n"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-013",
+      "name": "HubSpot — Log Engagement",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2600,
+        180
+      ],
+      "parameters": {
+        "functionCode": "\n// ── HubSpot 429-aware HTTP wrapper ───────────────────────────────────────\n// Retries on 429 Too Many Requests (HubSpot: 100 req / 10 sec).\n// Respects Retry-After header if present; falls back to 2s → 4s → 8s.\n// Max 3 retries. Throws on 4th failure or non-429 error.\nconst hsRequest = async (opts, attempt = 0) => {\n  try {\n    return await $helpers.httpRequest(opts);\n  } catch (err) {\n    const status = err.response?.statusCode || err.statusCode || 0;\n    if (status === 429 && attempt < 3) {\n      const retryAfterMs =\n        parseInt(err.response?.headers?.['retry-after'] || '0', 10) * 1000\n        || (2 ** attempt) * 2000;   // 2s, 4s, 8s\n      await new Promise(r => setTimeout(r, retryAfterMs));\n      return hsRequest(opts, attempt + 1);\n    }\n    throw err;   // re-throw if not 429 or out of retries\n  }\n};\n\n// ── Log engagement (email/note/meeting) to HubSpot ───────────────────────\n// Uses hsRequest (429-aware) for the engagements API call.\n\nconst ctx       = $input.first().json;\nconst token     = $env.HUBSPOT_API_KEY;\nconst contactId = ctx.hubspot_contact_id_resolved;\nconst dealId    = ctx.hubspot_deal_id_resolved;\n\nif (!contactId) {\n  return [{ json: { ...ctx, hubspot_engagement_id: null, engagement_skipped: true } }];\n}\n\nconst headers = {\n  'Authorization': `Bearer ${token}`,\n  'Content-Type':  'application/json'\n};\n\nconst EVENT_MAP = {\n  'email.sent':     { type: 'EMAIL',   subject: ctx.subject || 'Outreach email sent',   body: `Step ${ctx.step_number || ''} — ${ctx.strategy_used || 'outreach'} strategy` },\n  'reply.received': { type: 'NOTE',    subject: 'Lead replied',                          body: `Intent: ${ctx.intent || 'unknown'} | Sentiment: ${ctx.sentiment || 'unknown'} | Summary: ${ctx.reply_summary || ''}` },\n  'meeting.booked': { type: 'MEETING', subject: 'Meeting booked via AZOX',              body: `Scheduled: ${ctx.scheduled_at || 'TBC'} | Meeting ID: ${ctx.meeting_id || ''}` },\n  'lead.scored':    { type: 'NOTE',    subject: 'ICP score assigned by AZOX',           body: `Tier: ${ctx.tier} | Score: ${ctx.score} | Breakdown: ${JSON.stringify(ctx.score_breakdown || {}).slice(0, 200)}` }\n};\n\nconst engMap = EVENT_MAP[ctx.event] || {\n  type: 'NOTE', subject: ctx.event,\n  body: JSON.stringify({ event: ctx.event }).slice(0, 500)\n};\n\nconst engBody = {\n  engagement: { active: true, type: engMap.type, timestamp: Date.now() },\n  associations: {\n    contactIds: [parseInt(contactId)],\n    dealIds:    dealId ? [parseInt(dealId)] : []\n  },\n  metadata: {\n    subject: engMap.subject,\n    body:    engMap.body,\n    ...(engMap.type === 'EMAIL' ? {\n      from:   { email: $env.SENDER_EMAIL },\n      to:     [{ email: ctx.email }],\n      status: 'SENT'\n    } : {}),\n    ...(engMap.type === 'MEETING' ? {\n      startTime:      ctx.scheduled_at ? new Date(ctx.scheduled_at).getTime() : Date.now(),\n      endTime:        ctx.scheduled_at ? new Date(ctx.scheduled_at).getTime() + 1800000 : Date.now() + 1800000,\n      title:          engMap.subject,\n      meetingOutcome: 'SCHEDULED'\n    } : {})\n  }\n};\n\nconst resp   = await hsRequest({\n  method: 'POST',\n  url:    'https://api.hubapi.com/engagements/v1/engagements',\n  headers,\n  body:   JSON.stringify(engBody)\n});\nconst result = typeof resp === 'string' ? JSON.parse(resp) : resp;\n\nreturn [{ json: { ...ctx, hubspot_engagement_id: result?.engagement?.id || null } }];\n"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-014",
+      "name": "Save HubSpot Mapping",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2840,
+        180
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO crm_mappings (\n  lead_id, crm_provider,\n  hubspot_contact_id, hubspot_deal_id,\n  last_synced_at, created_at\n) VALUES (\n  $1, 'hubspot', $2, $3, NOW(), NOW()\n)\nON CONFLICT (lead_id, crm_provider)\nDO UPDATE SET\n  hubspot_contact_id = EXCLUDED.hubspot_contact_id,\n  hubspot_deal_id    = EXCLUDED.hubspot_deal_id,\n  last_synced_at     = NOW();",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  $json.hubspot_contact_id_resolved || null,\n  $json.hubspot_deal_id_resolved    || null\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-015",
+      "name": "Meeting Booked? — Notify AE",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        3080,
+        180
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.event }}",
+              "value2": "meeting.booked"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-016",
+      "name": "Slack — Notify AE",
+      "type": "n8n-nodes-base.slack",
+      "position": [
+        3320,
+        120
+      ],
+      "parameters": {
+        "operation": "post",
+        "channel": "={{ $env.SLACK_AE_CHANNEL || '#ae-notifications' }}",
+        "text": "={{ `🎯 *Meeting Booked!*\\n*Lead:* ${$json.full_name || $json.email}  |  *Company:* ${$json.company}\\n*Tier:* ${$json.tier}  |  *Score:* ${$json.score}\\n*Scheduled:* ${$json.scheduled_at || 'TBC'}\\n*HubSpot Deal:* ${$json.hubspot_deal_id_resolved && $env.HUBSPOT_PORTAL_ID ? 'https://app.hubspot.com/contacts/' + $env.HUBSPOT_PORTAL_ID + '/deal/' + $json.hubspot_deal_id_resolved : $json.hubspot_deal_id_resolved ? 'Deal ID: ' + $json.hubspot_deal_id_resolved : 'N/A'}\\n*Industry:* ${$json.industry || 'Unknown'}  |  *Size:* ${$json.employee_count || '?'} employees` }}",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "slack-main",
+          "name": "AZOX Slack"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-017",
+      "name": "Salesforce — Get Access Token",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2120,
+        480
+      ],
+      "parameters": {
+        "functionCode": "// ── Salesforce OAuth2 client_credentials flow ────────────────────────────\n// Uses Connected App client_id + client_secret for server-to-server auth.\n// Token is cached in Redis for 1h to avoid repeated auth calls.\n\nconst cacheKey = 'salesforce:access_token';\n\n// Check Redis cache first\nlet cached = null;\ntry {\n  const r = await $helpers.redis.get(cacheKey);\n  if (r) cached = JSON.parse(r);\n} catch(_) {}\n\nif (cached?.access_token) {\n  return [{ json: { ...$input.first().json, sf_access_token: cached.access_token, sf_instance_url: cached.instance_url } }];\n}\n\n// Fetch new token\nconst params = new URLSearchParams({\n  grant_type:    'client_credentials',\n  client_id:     $env.SALESFORCE_CLIENT_ID,\n  client_secret: $env.SALESFORCE_CLIENT_SECRET\n});\n\nconst resp = await $helpers.httpRequest({\n  method:  'POST',\n  url:     `https://${$env.SALESFORCE_DOMAIN || 'login.salesforce.com'}/services/oauth2/token`,\n  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },\n  body:    params.toString()\n});\n\nconst token = typeof resp === 'string' ? JSON.parse(resp) : resp;\n\nif (!token.access_token) throw new Error('SF_AUTH_FAILED: ' + JSON.stringify(token));\n\n// Cache for 55 minutes (tokens expire after 60m)\nawait $helpers.redis.set(cacheKey, JSON.stringify({\n  access_token: token.access_token,\n  instance_url: token.instance_url\n}), 'EX', 3300);\n\nreturn [{\n  json: {\n    ...$input.first().json,\n    sf_access_token:  token.access_token,\n    sf_instance_url:  token.instance_url\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-018",
+      "name": "Salesforce — Upsert Contact",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2360,
+        480
+      ],
+      "parameters": {
+        "functionCode": "// ── Salesforce Contact Upsert via Composite API ──────────────────────────\n// Uses PATCH /sobjects/Contact/email/{email} (External ID upsert).\n// Requires \"Email\" field marked as External ID in Salesforce.\n\nconst ctx     = $input.first().json;\nconst baseUrl = ctx.sf_instance_url;\nconst token   = ctx.sf_access_token;\n\nconst headers = {\n  'Authorization': `Bearer ${token}`,\n  'Content-Type':  'application/json'\n};\n\nconst contactBody = {\n  FirstName:   ctx.first_name || '',\n  LastName:    ctx.last_name  || ctx.full_name || ctx.email,\n  Title:       ctx.title      || '',\n  AccountName: ctx.company    || '',\n  Phone:       ctx.phone      || '',\n  LeadSource:  'AZOX AI',\n  // Custom fields — must exist in Salesforce org\n  AZOX_Lead_ID__c:     ctx.lead_id,\n  AZOX_Score__c:       ctx.score    || 0,\n  AZOX_Tier__c:        ctx.tier     || '',\n  AZOX_Status__c:      ctx.status   || '',\n  AZOX_Last_Action__c: ctx.event    || ''\n};\n\n// Upsert by email (External ID)\nconst encodedEmail = encodeURIComponent(ctx.email);\nconst resp = await $helpers.httpRequest({\n  method:  'PATCH',\n  url:     `${baseUrl}/services/data/v59.0/sobjects/Contact/Email/${encodedEmail}`,\n  headers,\n  body:    JSON.stringify(contactBody)\n});\n\n// 204 = updated, 201 = created (no body on PATCH upsert)\n// We need to query to get the ID\nconst queryResp = await $helpers.httpRequest({\n  method:  'GET',\n  url:     `${baseUrl}/services/data/v59.0/query?q=SELECT+Id+FROM+Contact+WHERE+Email='${encodedEmail}'+LIMIT+1`,\n  headers\n});\n\nconst queryResult = typeof queryResp === 'string' ? JSON.parse(queryResp) : queryResp;\nconst sfContactId = queryResult?.records?.[0]?.Id || ctx.salesforce_contact_id || null;\n\nreturn [{ json: { ...ctx, sf_contact_id: sfContactId } }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-019",
+      "name": "Salesforce — Upsert Opportunity",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2600,
+        480
+      ],
+      "parameters": {
+        "functionCode": "// ── Salesforce Opportunity Upsert ────────────────────────────────────────\n// Maps AZOX status to Salesforce opportunity stages.\n// Upsert by AZOX_Lead_ID__c (External ID on Opportunity object).\n\nconst ctx     = $input.first().json;\nconst baseUrl = ctx.sf_instance_url;\nconst token   = ctx.sf_access_token;\n\nconst headers = {\n  'Authorization': `Bearer ${token}`,\n  'Content-Type':  'application/json'\n};\n\n// AZOX status → Salesforce opportunity stage\nconst SF_STAGE_MAP = {\n  new:              'Prospecting',\n  scored:           'Qualification',\n  in_sequence:      'Needs Analysis',\n  replied:          'Value Proposition',\n  meeting_proposed: 'Proposal/Price Quote',\n  meeting_booked:   'Perception Analysis'\n};\n\nconst sfStage = SF_STAGE_MAP[ctx.status] || 'Prospecting';\n\nconst oppBody = {\n  Name:            `${ctx.company || ''} — ${ctx.full_name || ctx.email}`,\n  StageName:       sfStage,\n  CloseDate:       new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),\n  LeadSource:      'AZOX AI',\n  Amount:          ctx.annual_revenue || 0,\n  AccountId:       ctx.sf_account_id  || null,\n  AZOX_Lead_ID__c: ctx.lead_id,\n  AZOX_Tier__c:    ctx.tier   || '',\n  AZOX_Score__c:   ctx.score  || 0\n};\n\n// Upsert by AZOX_Lead_ID__c\nconst resp = await $helpers.httpRequest({\n  method:  'PATCH',\n  url:     `${baseUrl}/services/data/v59.0/sobjects/Opportunity/AZOX_Lead_ID__c/${ctx.lead_id}`,\n  headers,\n  body:    JSON.stringify(oppBody)\n}).catch(e => ({ error: e.message }));\n\n// Get the Opportunity ID\nlet sfOppId = ctx.salesforce_opp_id || null;\ntry {\n  const q = await $helpers.httpRequest({\n    method: 'GET',\n    url:    `${baseUrl}/services/data/v59.0/query?q=SELECT+Id+FROM+Opportunity+WHERE+AZOX_Lead_ID__c='${ctx.lead_id}'+LIMIT+1`,\n    headers\n  });\n  const qr = typeof q === 'string' ? JSON.parse(q) : q;\n  sfOppId = qr?.records?.[0]?.Id || sfOppId;\n} catch(_) {}\n\nreturn [{ json: { ...ctx, sf_opportunity_id: sfOppId } }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-020",
+      "name": "Save Salesforce Mapping",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2840,
+        480
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO crm_mappings (\n  lead_id, crm_provider,\n  salesforce_contact_id, salesforce_opportunity_id,\n  last_synced_at, created_at\n) VALUES (\n  $1, 'salesforce', $2, $3, NOW(), NOW()\n)\nON CONFLICT (lead_id, crm_provider)\nDO UPDATE SET\n  salesforce_contact_id     = EXCLUDED.salesforce_contact_id,\n  salesforce_opportunity_id = EXCLUDED.salesforce_opportunity_id,\n  last_synced_at            = NOW();",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  $json.sf_contact_id    || null,\n  $json.sf_opportunity_id || null\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-021",
+      "name": "Write Sales Metric",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3320,
+        340
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sales_metrics (\n  client_id, lead_id, event_type,\n  industry, seniority, tier,\n  sequence_step, variant_group,\n  created_at\n) VALUES (\n  $1, $2, $3,\n  $4, $5, $6,\n  $7, $8,\n  NOW()\n);",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.client_id,\n  $json.lead_id,\n  $json.event,\n  $json.industry      || null,\n  $json.title         || null,\n  $json.tier          || null,\n  $json.step_number   || null,\n  $json.subject_variant || null\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-022",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3560,
+        340
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES ('crm_synced', $1, $2::jsonb, NOW());",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify({\n    workflow:        'WF-08',\n    event:           $json.event,\n    crm_provider:    $json.crm_provider,\n    deal_stage:      $json.deal_stage,\n    hubspot_deal_id: $json.hubspot_deal_id_resolved || null,\n    sf_opp_id:       $json.sf_opportunity_id || null,\n    execution_id:    $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-023",
+      "name": "Emit crm.updated Event",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3800,
+        340
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'crm.updated',\n  $1::jsonb,\n  NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  lead_id:         $json.lead_id,\n  event:           $json.event,\n  crm_provider:    $json.crm_provider,\n  deal_stage:      $json.deal_stage,\n  tier:            $json.tier,\n  execution_id:    $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-024",
+      "name": "Webhook HubSpot Inbound",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        200,
+        700
+      ],
+      "parameters": {
+        "path": "hubspot-crm",
+        "httpMethod": "POST",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-025",
+      "name": "Parse HubSpot Event",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        700
+      ],
+      "parameters": {
+        "functionCode": "// ── Parse HubSpot deal.propertyChange webhook ─────────────────────────────\n// HubSpot sends arrays of change events.\n// We care about: dealstage changes on deals that have azox_lead_id set.\n\nconst body = $input.first().json.body || $input.first().json;\nconst events = Array.isArray(body) ? body : [body];\n\n// Filter for deal stage changes\nconst dealChanges = events.filter(e =>\n  e.subscriptionType === 'deal.propertyChange' &&\n  e.propertyName     === 'dealstage'\n);\n\nif (dealChanges.length === 0) {\n  return [{ json: { skip: true, reason: 'no_relevant_events', raw: events.length } }];\n}\n\n// Take the first (or most recent) relevant change\nconst change = dealChanges[0];\n\nreturn [{\n  json: {\n    hs_deal_id:       String(change.objectId || ''),\n    hs_property:      change.propertyName,\n    hs_new_value:     change.propertyValue || '',\n    hs_subscription:  change.subscriptionType,\n    hs_portal_id:     change.portalId,\n    received_at:      new Date().toISOString()\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-026",
+      "name": "Relevant Event?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        680,
+        700
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.skip }}",
+              "value2": true,
+              "operation": "notEqual"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-027",
+      "name": "Fetch Deal AZOX Metadata",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        920,
+        700
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ `https://api.hubapi.com/crm/v3/objects/deals/${$json.hs_deal_id}?properties=azox_lead_id,azox_tier,dealstage,amount,dealname` }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.HUBSPOT_API_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-028",
+      "name": "Write Lead Outcome",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        1160,
+        700
+      ],
+      "parameters": {
+        "functionCode": "// ── Map HubSpot closed stage to lead_outcome record ──────────────────────\n// Only write outcome when the deal reaches a terminal stage.\n\nconst dealData  = $input.first().json;\nconst props     = dealData.properties || {};\nconst azoxLeadId = props.azox_lead_id?.value || props.azox_lead_id || null;\n\nif (!azoxLeadId) {\n  return [{ json: { skip: true, reason: 'no_azox_lead_id_on_deal' } }];\n}\n\n// Terminal stage mapping\nconst TERMINAL_STAGES = {\n  closedwon:          { held: true,  result: 'won' },\n  closedlost:         { held: false, result: 'lost' },\n  'Closed Won':       { held: true,  result: 'won' },\n  'Closed Lost':      { held: false, result: 'lost' }\n};\n\nconst stage    = props.dealstage?.value || props.dealstage || '';\nconst terminal = TERMINAL_STAGES[stage];\n\nif (!terminal) {\n  return [{ json: { skip: true, reason: `non_terminal_stage: ${stage}` } }];\n}\n\nconst amount = parseInt(props.amount?.value || props.amount || 0, 10);\n\nreturn [{\n  json: {\n    azox_lead_id:  azoxLeadId,\n    deal_result:   terminal.result,\n    meeting_held:  terminal.held,\n    deal_value:    amount,\n    hs_deal_id:    dealData.id || String(dealData.hs_deal_id || ''),\n    hs_stage:      stage,\n    ready_to_write: true\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-029",
+      "name": "Insert Lead Outcome",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1400,
+        700
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO lead_outcomes (\n  lead_id, meeting_held, deal_value, deal_result,\n  created_at\n)\nSELECT\n  id, $2, $3, $4, NOW()\nFROM leads\nWHERE id = $1::uuid\nON CONFLICT DO NOTHING;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.azox_lead_id,\n  $json.meeting_held,\n  $json.deal_value,\n  $json.deal_result\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-030",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        500
+      ],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst msg = err.message || 'Unknown error in WF-08';\n\nreturn [{\n  json: {\n    status:       msg.includes('UNAUTHORIZED') ? 'unauthorized' :\n                  msg.includes('LEAD_NOT_FOUND') ? 'lead_not_found' : 'error',\n    message:      msg,\n    workflow:     'WF-08',\n    timestamp:    new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf08-node-031",
+      "name": "Return Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        680,
+        500
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($node['Handle Error'].json) }}",
+        "options": {
+          "responseCode": "={{ $node['Handle Error'].json.status === 'unauthorized' ? 401 : 422 }}"
+        }
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Webhook CRM Sync": {
+      "main": [
+        [
+          {
+            "node": "Verify Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Token": {
+      "main": [
+        [
+          {
+            "node": "ACK Immediately",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Check Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ACK Immediately": {
+      "main": [
+        []
+      ]
+    },
+    "Check Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "Already Synced?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already Synced?": {
+      "main": [
+        [
+          {
+            "node": "Set Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop — Already Synced",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "Load Lead and Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Lead and Config": {
+      "main": [
+        [
+          {
+            "node": "Prepare CRM Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare CRM Context": {
+      "main": [
+        [
+          {
+            "node": "Route by CRM Provider",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by CRM Provider": {
+      "main": [
+        [
+          {
+            "node": "HubSpot — Upsert Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Salesforce — Get Access Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot — Upsert Contact": {
+      "main": [
+        [
+          {
+            "node": "HubSpot — Upsert Deal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot — Upsert Deal": {
+      "main": [
+        [
+          {
+            "node": "HubSpot — Log Engagement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot — Log Engagement": {
+      "main": [
+        [
+          {
+            "node": "Save HubSpot Mapping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save HubSpot Mapping": {
+      "main": [
+        [
+          {
+            "node": "Meeting Booked? — Notify AE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Meeting Booked? — Notify AE": {
+      "main": [
+        [
+          {
+            "node": "Slack — Notify AE",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write Sales Metric",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack — Notify AE": {
+      "main": [
+        [
+          {
+            "node": "Write Sales Metric",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Salesforce — Get Access Token": {
+      "main": [
+        [
+          {
+            "node": "Salesforce — Upsert Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Salesforce — Upsert Contact": {
+      "main": [
+        [
+          {
+            "node": "Salesforce — Upsert Opportunity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Salesforce — Upsert Opportunity": {
+      "main": [
+        [
+          {
+            "node": "Save Salesforce Mapping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Salesforce Mapping": {
+      "main": [
+        [
+          {
+            "node": "Write Sales Metric",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Sales Metric": {
+      "main": [
+        [
+          {
+            "node": "Log Activity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Activity": {
+      "main": [
+        [
+          {
+            "node": "Emit crm.updated Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook HubSpot Inbound": {
+      "main": [
+        [
+          {
+            "node": "Parse HubSpot Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse HubSpot Event": {
+      "main": [
+        [
+          {
+            "node": "Relevant Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Relevant Event?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Deal AZOX Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Fetch Deal AZOX Metadata": {
+      "main": [
+        [
+          {
+            "node": "Write Lead Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Lead Outcome": {
+      "main": [
+        [
+          {
+            "node": "Insert Lead Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Error": {
+      "main": [
+        [
+          {
+            "node": "Return Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    "azox",
+    "agent-x",
+    "crm-sync",
+    "v2"
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "version": "2.0.0",
+    "changelog": "v2: HubSpot 429 retry logic on Deal + Engagement nodes; fixed Slack deal deep-link URL"
+  }
+}

@@ -1,0 +1,993 @@
+{
+  "name": "WF-05 Email Sequence Engine",
+  "nodes": [
+    {
+      "id": "wf05-node-001",
+      "name": "Cron Every 10 Minutes",
+      "type": "n8n-nodes-base.cron",
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 10,
+              "unit": "minutes"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-002",
+      "name": "Check Existing Lock",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "operation": "get",
+        "key": "lock:wf05:run"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-003",
+      "name": "Lock Free?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.value }}",
+              "operation": "isEmpty"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-004",
+      "name": "Acquire Run Lock",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        920,
+        300
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "lock:wf05:run",
+        "value": "={{ $execution.id }}",
+        "expire": true,
+        "ttl": 480
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-005",
+      "name": "Stop \u2014 Already Running",
+      "type": "n8n-nodes-base.noOp",
+      "position": [
+        920,
+        480
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-006",
+      "name": "Fetch Scheduled Batch",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1160,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  ss.id             AS step_id,\n  ss.sequence_id,\n  ss.step_number,\n  ss.step_type,\n  ss.subject,\n  ss.body_text,\n  ss.preview_text,\n  ss.subject_variant,\n  ss.subject_a,\n  ss.subject_b,\n  ss.strategy_used,\n  ss.confidence,\n  ss.scheduled_at,\n  l.id              AS lead_id,\n  l.email           AS to_email,\n  l.first_name,\n  l.full_name,\n  l.company,\n  l.icp_tier        AS tier,\n  l.status          AS lead_status,\n  -- Priority: A=1, B=2, C=3 \u2014 Tier A leads always send first\n  CASE l.icp_tier\n    WHEN 'A' THEN 1\n    WHEN 'B' THEN 2\n    WHEN 'C' THEN 3\n    ELSE 2\n  END               AS tier_priority\nFROM sequence_steps ss\nJOIN sequences s ON s.id  = ss.sequence_id\nJOIN leads     l ON l.id  = s.lead_id\nWHERE ss.status       = 'scheduled'\n  AND ss.scheduled_at <= NOW()\n  AND s.status         = 'active'\n  AND l.status        != 'unsubscribed'\n  AND l.status        != 'disqualified'\nORDER BY\n  tier_priority ASC,\n  ss.scheduled_at   ASC\nLIMIT 5;",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-007",
+      "name": "Any Emails Due?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $items('Fetch Scheduled Batch').length > 0 }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-008",
+      "name": "Release Run Lock (No Work)",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1640,
+        480
+      ],
+      "parameters": {
+        "operation": "delete",
+        "key": "lock:wf05:run"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-009",
+      "name": "Split Into Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "position": [
+        1640,
+        300
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-010",
+      "name": "Check Send Dedup",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1880,
+        300
+      ],
+      "parameters": {
+        "operation": "get",
+        "key": "={{ `sent:email:${$json.lead_id}:${$json.step_number}` }}"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-011",
+      "name": "Already Sent?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        2120,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.value }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-012",
+      "name": "Mark Step Duplicate Skipped",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2360,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sequence_steps\nSET status = 'skipped_duplicate', updated_at = NOW()\nWHERE id = $1;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.step_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-013",
+      "name": "Mark Step Sending",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2360,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sequence_steps\nSET status = 'sending', updated_at = NOW()\nWHERE id = $1\nRETURNING id, lead_id, step_number;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.step_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-014",
+      "name": "Build Email Content",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2600,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// \u2500\u2500 Build final email content v3 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n// Upgrade 2: timezone-aware send window check (9 AM \u2013 5 PM recipient local)\n// Link tracking wraps all hrefs; open pixel + CAN-SPAM footer appended.\n\nconst step      = $input.first().json;\nconst trackBase = $env.N8N_WEBHOOK_BASE_URL || 'https://your-n8n.com';\n\n// \u2500\u2500 Timezone-aware send window \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst COUNTRY_TZ = {\n  'United States': 'America/New_York', 'US': 'America/New_York',\n  'Canada': 'America/Toronto',\n  'United Kingdom': 'Europe/London', 'UK': 'Europe/London',\n  'Germany': 'Europe/Berlin', 'France': 'Europe/Paris',\n  'Netherlands': 'Europe/Amsterdam', 'Sweden': 'Europe/Stockholm',\n  'Australia': 'Australia/Sydney', 'India': 'Asia/Kolkata',\n  'Singapore': 'Asia/Singapore'\n};\n\nconst tz = COUNTRY_TZ[step.country || ''] || 'UTC';\n\nconst localHour = parseInt(\n  new Date().toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false }),\n  10\n);\n\nconst SEND_START = 9;    // 9 AM\nconst SEND_END   = 17;   // 5 PM\n\nif (localHour < SEND_START || localHour >= SEND_END) {\n  // Outside window \u2014 compute hours until next 9:30 AM in recipient tz\n  const hoursUntilOpen = localHour >= SEND_END\n    ? (24 - localHour) + SEND_START + 0.5   // past 5 PM \u2192 tomorrow\n    : SEND_START - localHour + 0.5;           // before 9 AM \u2192 later today\n\n  const reschedule_to = new Date(\n    Date.now() + hoursUntilOpen * 60 * 60 * 1000\n  ).toISOString();\n\n  return [{\n    json: {\n      ...step,\n      outside_send_window:  true,\n      reschedule_to,\n      recipient_tz:         tz,\n      recipient_local_hour: localHour\n    }\n  }];\n}\n\n// \u2500\u2500 Within window \u2014 build email \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst trackId   = `${step.sequence_id}_${step.step_id}`;\nconst unsubUrl  = `${trackBase}/webhook/unsubscribe?l=${step.lead_id}&s=${step.sequence_id}`;\nconst firstName = step.first_name || step.full_name?.split(' ')[0] || 'there';\n\nlet body = (step.body_text || '')\n  .replace(/\\{\\{\\s*first_name\\s*\\}\\}/gi, firstName)\n  .replace(/\\{\\{\\s*company\\s*\\}\\}/gi, step.company || '');\n\nfunction wrapLink(url) {\n  if (url.includes('track-') || url.includes('unsubscribe')) return url;\n  return `${trackBase}/webhook/track-click?t=${trackId}&l=${step.lead_id}&url=${encodeURIComponent(url)}`;\n}\nbody = body.replace(/href=\"(https?:\\/\\/[^\"]+)\"/gi, (_, url) => `href=\"${wrapLink(url)}\"`);\nbody = body.replace(\n  /(?<!href=\")(https?:\\/\\/[^\\s<\"]+)/gi,\n  (url) => `<a href=\"${wrapLink(url)}\">${url}</a>`\n);\n\nconst openPixel =\n  `<img src=\"${trackBase}/webhook/track-open?t=${trackId}&l=${step.lead_id}\" ` +\n  `width=\"1\" height=\"1\" style=\"display:none;\" alt=\"\" />`;\n\nconst htmlBody =\n  `<div style=\"font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#333;\">` +\n  body.replace(/\\n/g, '<br>') +\n  `</div><br><br>` +\n  `<p style=\"font-size:11px;color:#aaa;border-top:1px solid #eee;padding-top:8px;\">` +\n  `You received this because you match the profile of people we help. ` +\n  `<a href=\"${unsubUrl}\" style=\"color:#aaa;\">Unsubscribe</a>.` +\n  `</p>` + openPixel;\n\nreturn [{\n  json: {\n    ...step,\n    outside_send_window:  false,\n    recipient_tz:         tz,\n    recipient_local_hour: localHour,\n    first_name:           firstName,\n    final_subject:        step.subject,\n    final_body:           body,\n    html_body:            htmlBody,\n    track_id:             trackId,\n    unsubscribe_url:      unsubUrl\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-015",
+      "name": "Send Email via Gmail",
+      "type": "n8n-nodes-base.gmail",
+      "position": [
+        2840,
+        300
+      ],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $json.to_email }}",
+        "subject": "={{ $json.final_subject }}",
+        "emailType": "html",
+        "message": "={{ $json.html_body }}",
+        "options": {
+          "replyTo": "={{ $env.SENDER_EMAIL }}",
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-main",
+          "name": "AZOX Gmail"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-016",
+      "name": "Extract Gmail Thread IDs",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        3080,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// \u2500\u2500 Extract Gmail message + thread IDs from send response \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n// Fix: store gmail_message_id + gmail_thread_id so WF-06 can\n// match incoming replies back to the correct sequence step.\n//\n// Gmail send response shape:\n//   { id: 'messageId', threadId: 'threadId', labelIds: [...] }\n\nconst gmailResp = $input.first().json;\nconst prev      = $items('Build Email Content')[0].json;\n\nconst gmailMessageId = gmailResp.id       || gmailResp.messageId || null;\nconst gmailThreadId  = gmailResp.threadId || null;\n\nif (!gmailMessageId) {\n  // Log missing ID as warning \u2014 don't throw, email was sent successfully\n  console.warn(`WF-05: gmail_message_id missing for step ${prev.step_id}`);\n}\n\nreturn [{\n  json: {\n    ...prev,\n    gmail_message_id: gmailMessageId,\n    gmail_thread_id:  gmailThreadId\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-017",
+      "name": "Set Send Dedup Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        3320,
+        300
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `sent:email:${$json.lead_id}:${$json.step_number}` }}",
+        "value": "={{ $json.track_id }}",
+        "expire": true,
+        "ttl": 2592000
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-018",
+      "name": "Mark Step Sent",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3560,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sequence_steps\nSET\n  status           = 'sent',\n  sent_at          = NOW(),\n  gmail_message_id = $2,\n  gmail_thread_id  = $3,\n  updated_at       = NOW()\nWHERE id = $1\nRETURNING id, sequence_id, lead_id, step_number;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.step_id,\n  $json.gmail_message_id,\n  $json.gmail_thread_id\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-019",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3800,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES ('email_sent', $1, $2::jsonb, NOW());",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.lead_id,\n  JSON.stringify({\n    workflow:         'WF-05',\n    event:            'email.sent',\n    step_id:          $json.step_id,\n    sequence_id:      $json.sequence_id,\n    step_number:      $json.step_number,\n    subject:          $json.final_subject,\n    subject_variant:  $json.subject_variant,\n    strategy_used:    $json.strategy_used,\n    track_id:         $json.track_id,\n    gmail_message_id: $json.gmail_message_id,\n    gmail_thread_id:  $json.gmail_thread_id,\n    tier:             $json.tier,\n    tier_priority:    $json.tier_priority,\n    execution_id:     $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-020",
+      "name": "Determine Next Step",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        4040,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// \u2500\u2500 Sequence step scheduler \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n// Tier-aware cadence. Steps: 1\u2192follow_up\u2192value_add\u2192break_up\u2192end\n\nconst step = $input.first().json;\nconst tier = step.tier || 'B';\n\nconst cadence = {\n  A: [3, 4, 5],\n  B: [4, 5, 7],\n  C: [5, 7, 10]\n};\n\nconst delays      = cadence[tier] || cadence.B;\nconst currentStep = step.step_number;\nconst maxSteps    = 4;\n\nif (currentStep >= maxSteps) {\n  return [{ json: { ...step, next_step: null, sequence_complete: true } }];\n}\n\nconst delayDays   = delays[currentStep - 1] || 5;\nconst nextStepNum = currentStep + 1;\nconst scheduledAt = new Date(Date.now() + delayDays * 24 * 60 * 60 * 1000).toISOString();\n\nconst stepTypes = { 2: 'follow_up', 3: 'value_add', 4: 'break_up' };\n\nreturn [{\n  json: {\n    ...step,\n    next_step_number:  nextStepNum,\n    next_step_type:    stepTypes[nextStepNum] || 'follow_up',\n    next_scheduled_at: scheduledAt,\n    delay_days:        delayDays,\n    sequence_complete: false\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-021",
+      "name": "Sequence Complete?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        4280,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.sequence_complete }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-022",
+      "name": "Mark Sequence Complete",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4520,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sequences SET status = 'completed', updated_at = NOW() WHERE id = $1;\nUPDATE leads SET status = 'sequence_complete', updated_at = NOW() WHERE id = $2;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.sequence_id, $json.lead_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-023",
+      "name": "Generate Next Step Email",
+      "type": "n8n-nodes-base.openAi",
+      "position": [
+        4520,
+        460
+      ],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a B2B sales email writer. Write a follow-up email for a cold outreach sequence. Output ONLY valid JSON \u2014 no markdown, no preamble."
+            },
+            {
+              "role": "user",
+              "content": "={{ `Write step ${$json.next_step_number} (${$json.next_step_type}) for this sequence.\\n\\nLead: ${$json.first_name} at ${$json.company}\\nTier: ${$json.tier}\\nPrevious subject: ${$json.final_subject}\\nStrategy: ${$json.strategy_used || 'value_led'}\\n\\nStep guidance:\\n- follow_up: briefly ref previous email, one new insight, under 100 words\\n- value_add: relevant resource or insight, no hard sell\\n- break_up: short, acknowledge they're busy, leave door open\\n\\nReturn JSON:\\n{\\n  \"subject_a\": \"variant A\",\\n  \"subject_b\": \"variant B\",\\n  \"body\": \"plain text body\",\\n  \"preview_text\": \"max 90 chars\",\\n  \"confidence\": 0.0-1.0\\n}` }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.6,
+          "maxTokens": 500
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-main",
+          "name": "AZOX OpenAI"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-024",
+      "name": "Parse Next Step Email",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        4760,
+        460
+      ],
+      "parameters": {
+        "functionCode": "const raw = $input.first().json?.choices?.[0]?.message?.content\n         || $input.first().json?.message?.content || '';\n\nlet parsed = {};\ntry {\n  const start = raw.indexOf('{');\n  const end   = raw.lastIndexOf('}');\n  if (start === -1 || end === -1) throw new Error('no JSON found');\n  parsed = JSON.parse(raw.slice(start, end + 1));\n} catch(e) {\n  parsed = {\n    subject_a:    `Following up \u2014 ${$json.company}`,\n    subject_b:    `Quick question for ${$json.first_name}`,\n    body:         `Hi ${$json.first_name},\\n\\nJust following up on my last email. Happy to connect when the timing works.\\n\\nBest,\\nAlex`,\n    preview_text: 'Following up on my last email',\n    confidence:   0.5\n  };\n}\n\nconst useA    = Math.random() < 0.5;\nconst subject = useA ? (parsed.subject_a || parsed.subject_b) : (parsed.subject_b || parsed.subject_a);\n\nreturn [{\n  json: {\n    ...$input.first().json,\n    next_subject:          subject,\n    next_subject_a:        parsed.subject_a,\n    next_subject_b:        parsed.subject_b,\n    next_subject_variant:  useA ? 'A' : 'B',\n    next_body:             parsed.body,\n    next_preview_text:     parsed.preview_text,\n    next_confidence:       parseFloat(parsed.confidence) || 0.5\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-025",
+      "name": "Insert Next Step",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        5000,
+        460
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sequence_steps (\n  sequence_id, step_number, step_type,\n  subject, body_text, preview_text,\n  subject_variant, subject_a, subject_b,\n  strategy_used, confidence,\n  previous_step_id,\n  scheduled_at, status, created_at\n) VALUES (\n  $1, $2, $3,\n  $4, $5, $6,\n  $7, $8, $9,\n  $10, $11,\n  $12,\n  $13::timestamptz, 'scheduled', NOW()\n)\nRETURNING id AS step_id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.sequence_id,\n  $json.next_step_number,\n  $json.next_step_type,\n  $json.next_subject,\n  $json.next_body,\n  $json.next_preview_text,\n  $json.next_subject_variant,\n  $json.next_subject_a,\n  $json.next_subject_b,\n  $json.strategy_used || 'value_led',\n  $json.next_confidence,\n  $json.step_id,\n  $json.next_scheduled_at\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-026",
+      "name": "Emit email.sent Event",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        5240,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'email.sent',\n  $1::jsonb,\n  NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  lead_id:          $json.lead_id,\n  sequence_id:      $json.sequence_id,\n  step_id:          $json.step_id,\n  step_number:      $json.step_number,\n  tier:             $json.tier,\n  tier_priority:    $json.tier_priority,\n  subject_variant:  $json.subject_variant,\n  strategy_used:    $json.strategy_used,\n  gmail_thread_id:  $json.gmail_thread_id,\n  gmail_message_id: $json.gmail_message_id,\n  sequence_complete: $json.sequence_complete || false,\n  execution_id:     $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-027",
+      "name": "Release Run Lock",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        5480,
+        300
+      ],
+      "parameters": {
+        "operation": "delete",
+        "key": "lock:wf05:run"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-028",
+      "name": "Handle Send Error",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2840,
+        500
+      ],
+      "parameters": {
+        "functionCode": "const err  = $input.first().error || {};\nconst step = $items('Build Email Content')[0]?.json || {};\n\nreturn [{\n  json: {\n    step_id:       step.step_id,\n    lead_id:       step.lead_id,\n    sequence_id:   step.sequence_id,\n    step_number:   step.step_number,\n    error_message: err.message || 'unknown send error',\n    execution_id:  $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-029",
+      "name": "Mark Step Failed",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3080,
+        500
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sequence_steps\nSET\n  status       = CASE WHEN COALESCE(retry_count, 0) >= 2 THEN 'failed' ELSE 'scheduled' END,\n  retry_count  = COALESCE(retry_count, 0) + 1,\n  scheduled_at = CASE WHEN COALESCE(retry_count, 0) < 2 THEN NOW() + INTERVAL '10 minutes' ELSE scheduled_at END,\n  last_error   = $2,\n  updated_at   = NOW()\nWHERE id = $1\nRETURNING id, status, retry_count;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.step_id, $json.error_message ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-030",
+      "name": "Within Send Window?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        2840,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.outside_send_window }}",
+              "value2": false
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf05-node-031",
+      "name": "Reschedule Outside Window",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3080,
+        500
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sequence_steps\nSET\n  status       = 'scheduled',\n  scheduled_at = $2::timestamptz,\n  updated_at   = NOW()\nWHERE id = $1\nRETURNING id, scheduled_at;",
+        "additionalFields": {
+          "queryParams": "={{ [ $json.step_id, $json.reschedule_to ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Cron Every 10 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Check Existing Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Existing Lock": {
+      "main": [
+        [
+          {
+            "node": "Lock Free?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lock Free?": {
+      "main": [
+        [
+          {
+            "node": "Acquire Run Lock",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop \u2014 Already Running",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Acquire Run Lock": {
+      "main": [
+        [
+          {
+            "node": "Fetch Scheduled Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Scheduled Batch": {
+      "main": [
+        [
+          {
+            "node": "Any Emails Due?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Emails Due?": {
+      "main": [
+        [
+          {
+            "node": "Split Into Items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release Run Lock (No Work)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Into Items": {
+      "main": [
+        [
+          {
+            "node": "Check Send Dedup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Send Dedup": {
+      "main": [
+        [
+          {
+            "node": "Already Sent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already Sent?": {
+      "main": [
+        [
+          {
+            "node": "Mark Step Duplicate Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Step Sending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Step Duplicate Skipped": {
+      "main": [
+        [
+          {
+            "node": "Split Into Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Step Sending": {
+      "main": [
+        [
+          {
+            "node": "Build Email Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Email Content": {
+      "main": [
+        [
+          {
+            "node": "Within Send Window?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email via Gmail": {
+      "main": [
+        [
+          {
+            "node": "Extract Gmail Thread IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Send Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Gmail Thread IDs": {
+      "main": [
+        [
+          {
+            "node": "Set Send Dedup Key",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Send Dedup Key": {
+      "main": [
+        [
+          {
+            "node": "Mark Step Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Step Sent": {
+      "main": [
+        [
+          {
+            "node": "Log Activity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Activity": {
+      "main": [
+        [
+          {
+            "node": "Determine Next Step",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Determine Next Step": {
+      "main": [
+        [
+          {
+            "node": "Sequence Complete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sequence Complete?": {
+      "main": [
+        [
+          {
+            "node": "Mark Sequence Complete",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Generate Next Step Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Sequence Complete": {
+      "main": [
+        [
+          {
+            "node": "Emit email.sent Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Next Step Email": {
+      "main": [
+        [
+          {
+            "node": "Parse Next Step Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Next Step Email": {
+      "main": [
+        [
+          {
+            "node": "Insert Next Step",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Next Step": {
+      "main": [
+        [
+          {
+            "node": "Emit email.sent Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Emit email.sent Event": {
+      "main": [
+        [
+          {
+            "node": "Release Run Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Send Error": {
+      "main": [
+        [
+          {
+            "node": "Mark Step Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Within Send Window?": {
+      "main": [
+        [
+          {
+            "node": "Send Email via Gmail",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reschedule Outside Window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reschedule Outside Window": {
+      "main": [
+        [
+          {
+            "node": "Split Into Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    "azox",
+    "agent-x",
+    "sequence-engine",
+    "v3"
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

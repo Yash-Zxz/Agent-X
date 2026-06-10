@@ -1,0 +1,947 @@
+{
+  "name": "WF-10 Signal Monitor",
+  "nodes": [
+    {
+      "id": "wf10-node-001",
+      "name": "Cron — Every 6 Hours",
+      "type": "n8n-nodes-base.cron",
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 6,
+              "unit": "hours"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-002",
+      "name": "Acquire Run Lock",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// SET NX EX — only succeeds if key doesn't exist\n// Returns null if lock already held → we stop execution\nconst lockKey = 'lock:wf10:signal_monitor';\nconst lockTTL = 21600;   // 6 hours in seconds\n\nconst result = await $helpers.redis.set(lockKey, $execution.id, 'EX', lockTTL, 'NX');\n\nif (!result) {\n  // Lock already held by another execution — stop gracefully\n  throw new Error('WF10_LOCK_HELD: signal monitor already running, skipping this cycle');\n}\n\nreturn [{ json: { lock_key: lockKey, started_at: new Date().toISOString() } }];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-003",
+      "name": "Fetch Active Companies",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT DISTINCT\n  c.id,\n  c.name,\n  c.domain,\n  c.website,\n  c.employee_count,\n  c.annual_revenue,\n  c.tech_stack,\n  c.homepage_hash,\n  c.last_signal_check,\n  c.updated_at,\n  -- best lead for this company (highest tier/score)\n  (\n    SELECT l2.id FROM leads l2\n    WHERE l2.company_id = c.id\n      AND l2.status NOT IN ('unsubscribed','human_owned')\n    ORDER BY l2.score DESC\n    LIMIT 1\n  ) AS best_lead_id,\n  (\n    SELECT l2.icp_tier FROM leads l2\n    WHERE l2.company_id = c.id\n      AND l2.status NOT IN ('unsubscribed','human_owned')\n    ORDER BY l2.score DESC\n    LIMIT 1\n  ) AS best_lead_tier\nFROM companies c\nJOIN leads l ON l.company_id = c.id\nWHERE l.updated_at > NOW() - INTERVAL '90 days'\n  AND l.do_not_contact = FALSE\n  AND c.domain IS NOT NULL\nORDER BY c.last_signal_check ASC NULLS FIRST\nLIMIT 50;   -- conservative batch size to protect API rate limits"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-004",
+      "name": "Any Companies?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        920,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $items().length }}",
+              "operation": "largerEqual",
+              "value2": 1
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-005",
+      "name": "Release Lock — No Companies",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1160,
+        460
+      ],
+      "parameters": {
+        "operation": "delete",
+        "key": "lock:wf10:signal_monitor"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-006",
+      "name": "Check Signal Dedup Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1160,
+        300
+      ],
+      "parameters": {
+        "operation": "get",
+        "key": "={{ `signal:checked:${$json.id}` }}"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-007",
+      "name": "Already Checked Recently?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.value }}",
+              "operation": "isEmpty"
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-008",
+      "name": "Skip — Checked Recently",
+      "type": "n8n-nodes-base.noOp",
+      "position": [
+        1640,
+        460
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-009",
+      "name": "Set Signal Dedup Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        1640,
+        300
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `signal:checked:${$json.id}` }}",
+        "value": "={{ new Date().toISOString() }}",
+        "expire": true,
+        "ttl": 21600
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-010",
+      "name": "Apollo — Org Enrichment",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        1880,
+        140
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apollo.io/v1/organizations/enrich",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Api-Key",
+              "value": "={{ $env.APOLLO_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ domain: $json.domain }) }}",
+        "options": {
+          "timeout": 10000,
+          "ignoreResponseCode": true,
+          "retry": {
+            "maxRetries": 2,
+            "retryOnFail": true,
+            "waitBetweenTries": 3000
+          }
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-011",
+      "name": "Crunchbase — Funding Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        1880,
+        280
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ `https://api.crunchbase.com/api/v4/entities/organizations/${encodeURIComponent($json.domain.replace(/\\..+$/,''))}` }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-cb-user-key",
+              "value": "={{ $env.CRUNCHBASE_API_KEY }}"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "field_ids",
+              "value": "funding_rounds,short_description,num_employees_enum,last_funding_type,last_funding_total"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "ignoreResponseCode": true,
+          "retry": {
+            "maxRetries": 2,
+            "retryOnFail": true,
+            "waitBetweenTries": 3000
+          }
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-012",
+      "name": "Jina — Website Scrape",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        1880,
+        420
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ `https://r.jina.ai/${$json.website || 'https://' + $json.domain}` }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.JINA_API_KEY }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Return-Format",
+              "value": "text"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "ignoreResponseCode": true,
+          "retry": {
+            "maxRetries": 1,
+            "retryOnFail": true,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-013",
+      "name": "BuiltWith — Tech Stack",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        1880,
+        560
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ `https://api.builtwith.com/v21/api.json?KEY=${$env.BUILTWITH_API_KEY}&LOOKUP=${$json.domain}` }}",
+        "options": {
+          "timeout": 10000,
+          "ignoreResponseCode": true,
+          "retry": {
+            "maxRetries": 2,
+            "retryOnFail": true,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-014",
+      "name": "Detect Signals",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        2120,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// ── Signal detection logic ───────────────────────────────────────────────\n// Spec thresholds:\n//   hiring_spike      : employee_count growth > 20% vs stored value\n//   funding_round     : new funding event since last_checked\n//   website_change    : content diff > 30% vs stored homepage_hash\n//   tech_stack_change : new positive tech signal added to stack\n//\n// Priority map (Improvement 2):\n//   funding_round     → HIGH\n//   hiring_spike      → HIGH\n//   tech_stack_change → MEDIUM\n//   website_change    → LOW\n\nconst SIGNAL_PRIORITY = {\n  funding_round:     'HIGH',\n  hiring_spike:      'HIGH',\n  tech_stack_change: 'MEDIUM',\n  website_change:    'LOW'\n};\n\n// Priority emoji for Slack messages\nconst PRIORITY_EMOJI = { HIGH: '🔴', MEDIUM: '🟡', LOW: '🟢' };\n\nconst company = $items('Set Signal Dedup Key')[0].json;\n\nconst safeJson = (item) => {\n  try {\n    const v = item?.json;\n    return (typeof v === 'string') ? JSON.parse(v) : (v || {});\n  } catch(_) { return {}; }\n};\n\nconst apollo   = safeJson($items('Apollo — Org Enrichment')[0]);\nconst crunch   = safeJson($items('Crunchbase — Funding Data')[0]);\nconst jinaResp = $items('Jina — Website Scrape')[0]?.json || {};\nconst bwResp   = safeJson($items('BuiltWith — Tech Stack')[0]);\n\nconst signals = [];\nconst now     = new Date().toISOString();\n\n// ── Signal 1: Hiring Spike ───────────────────────────────────────────────\nconst apolloOrg     = apollo.organization || apollo;\nconst newHeadcount  = parseInt(apolloOrg.num_employees || apolloOrg.employee_count || 0, 10);\nconst prevHeadcount = parseInt(company.employee_count || 0, 10);\n\nif (prevHeadcount > 0 && newHeadcount > prevHeadcount * 1.20) {\n  signals.push({\n    signal_type: 'hiring_spike',\n    source:      'apollo',\n    evidence:    `Headcount grew from ${prevHeadcount} to ${newHeadcount} (+${Math.round((newHeadcount/prevHeadcount - 1) * 100)}%)`,\n    new_value:   newHeadcount,\n    prev_value:  prevHeadcount\n  });\n}\n\n// ── Signal 2: Funding Round ──────────────────────────────────────────────\nconst crunchProps   = crunch.properties || crunch;\nconst fundingRounds = crunchProps.funding_rounds || [];\nconst lastChecked   = company.last_signal_check || company.updated_at || '2000-01-01';\n\nconst newFunding = fundingRounds.find(fr => {\n  const announcedOn = fr.announced_on || fr.properties?.announced_on || '';\n  return announcedOn > lastChecked;\n});\n\nif (newFunding) {\n  const props  = newFunding.properties || newFunding;\n  const amount = props.money_raised?.value_usd || props.raised_amount_usd || 0;\n  const type   = props.investment_type || props.funding_type || 'funding';\n  signals.push({\n    signal_type: 'funding_round',\n    source:      'crunchbase',\n    evidence:    `New ${type} round: $${(amount / 1e6).toFixed(1)}M (announced ${props.announced_on || 'recently'})`,\n    new_value:   JSON.stringify({ type, amount, announced_on: props.announced_on }),\n    prev_value:  lastChecked\n  });\n}\n\n// ── Signal 3: Website Change ─────────────────────────────────────────────\nconst pageContent = jinaResp.data?.content || jinaResp.content || jinaResp.text || '';\nif (pageContent && pageContent.length > 100) {\n  let hashVal = 0;\n  const sample = pageContent.slice(0, 5000);\n  for (let i = 0; i < sample.length; i++) hashVal = (hashVal * 31 + sample.charCodeAt(i)) >>> 0;\n  const newHash  = hashVal.toString(36);\n  const prevHash = company.homepage_hash || '';\n\n  if (prevHash && newHash !== prevHash) {\n    const prevLen = prevHash.length > 0 ? parseInt(prevHash.split('_')[1] || '0') : 0;\n    const newLen  = pageContent.length;\n    const diffPct = prevLen > 0 ? Math.abs(newLen - prevLen) / prevLen * 100 : 100;\n\n    if (diffPct > 30 || !prevHash) {\n      signals.push({\n        signal_type: 'website_change',\n        source:      'jina',\n        evidence:    `Homepage content changed (hash: ${prevHash} → ${newHash}, ~${Math.round(diffPct)}% diff)`,\n        new_value:   `${newHash}_${newLen}`,\n        prev_value:  prevHash\n      });\n    }\n  }\n  company._new_homepage_hash = `${newHash}_${pageContent.length}`;\n}\n\n// ── Signal 4: Tech Stack Change ───────────────────────────────────────────\nconst bwResult = bwResp.Results?.[0]?.Result?.Paths?.[0]?.Technologies || [];\nconst newTechs = bwResult.map(t => (t.Name || t.name || '').toLowerCase()).filter(Boolean);\nconst prevTechStack = (() => {\n  try {\n    const v = company.tech_stack;\n    if (!v) return [];\n    return Array.isArray(v) ? v : JSON.parse(v);\n  } catch(_) { return []; }\n})();\n\nconst addedTechs = newTechs.filter(t => !prevTechStack.map(p => p.toLowerCase()).includes(t));\n\nconst HIGH_SIGNAL_TECHS = [\n  'salesforce', 'hubspot', 'marketo', 'pardot', 'outreach', 'salesloft',\n  'segment', 'amplitude', 'mixpanel', 'intercom', 'zendesk', 'drift',\n  'gong', 'chorus', 'apollo', 'zoominfo', 'clay', 'clearbit',\n  'greenhouse', 'lever', 'workday'\n];\n\nconst highSignalAdded = addedTechs.filter(t =>\n  HIGH_SIGNAL_TECHS.some(hs => t.includes(hs))\n);\n\nif (highSignalAdded.length > 0) {\n  signals.push({\n    signal_type: 'tech_stack_change',\n    source:      'builtwith',\n    evidence:    `New tech signals detected: ${highSignalAdded.join(', ')}`,\n    new_value:   JSON.stringify(newTechs.slice(0, 50)),\n    prev_value:  JSON.stringify(prevTechStack.slice(0, 50))\n  });\n}\n\n// ── Attach priority to every signal and return ────────────────────────────\nif (signals.length === 0) {\n  return [{ json: {\n    company_id:        company.id,\n    company_name:      company.name,\n    no_signals:        true,\n    checked_at:        now,\n    new_headcount:     newHeadcount,\n    new_homepage_hash: company._new_homepage_hash || company.homepage_hash || null,\n    new_tech_stack:    newTechs.length > 0 ? JSON.stringify(newTechs.slice(0, 50)) : null\n  }}];\n}\n\nreturn signals.map(s => {\n  const priority = SIGNAL_PRIORITY[s.signal_type] || 'LOW';\n  return {\n    json: {\n      ...s,\n      signal_priority:     priority,\n      priority_emoji:      PRIORITY_EMOJI[priority],\n      company_id:          company.id,\n      company_name:        company.name,\n      best_lead_id:        company.best_lead_id,\n      best_lead_tier:      company.best_lead_tier,\n      no_signals:          false,\n      checked_at:          now,\n      new_headcount:       newHeadcount    || null,\n      new_homepage_hash:   company._new_homepage_hash || null,\n      new_tech_stack:      newTechs.length > 0 ? JSON.stringify(newTechs.slice(0, 50)) : null\n    }\n  };\n});"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-015",
+      "name": "Update Company Baseline",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2360,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE companies\nSET\n  last_signal_check = NOW(),\n  employee_count    = COALESCE($2::integer, employee_count),\n  homepage_hash     = COALESCE($3, homepage_hash),\n  tech_stack        = COALESCE($4::jsonb, tech_stack),\n  updated_at        = NOW()\nWHERE id = $1::uuid;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.company_id,\n  $json.new_headcount         || null,\n  $json.new_homepage_hash     || null,\n  $json.new_tech_stack        || null\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-016",
+      "name": "Signal Found?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        2600,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.no_signals }}",
+              "value2": false
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-017",
+      "name": "Insert Signal Record",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2840,
+        180
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO company_signals (\n  company_id, signal_type, evidence, source,\n  actioned, created_at\n) VALUES (\n  $1::uuid, $2, $3, $4,\n  FALSE, NOW()\n)\nRETURNING id AS signal_id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.company_id,\n  $json.signal_type,\n  $json.evidence,\n  $json.source\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-018",
+      "name": "Emit company.signal.detected",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3080,
+        180
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO worker_events (worker_id, event_type, payload, created_at)\nVALUES (\n  (SELECT id FROM workers WHERE worker_type = 'agent-x' LIMIT 1),\n  'company.signal.detected',\n  $1::jsonb,\n  NOW()\n)\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ [ JSON.stringify({\n  company_id:     $json.company_id,\n  company_name:   $json.company_name,\n  signal_id:      $items('Insert Signal Record')[0].json.signal_id,\n  signal_type:    $json.signal_type,\n  source:         $json.source,\n  evidence:       $json.evidence,\n  best_lead_id:   $json.best_lead_id,\n  best_lead_tier: $json.best_lead_tier,\n  execution_id:   $execution.id\n}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-019",
+      "name": "Route by Signal Priority",
+      "type": "n8n-nodes-base.switch",
+      "position": [
+        3320,
+        180
+      ],
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.signal_priority }}",
+        "rules": {
+          "rules": [
+            {
+              "value2": "HIGH",
+              "output": 0
+            },
+            {
+              "value2": "MEDIUM",
+              "output": 1
+            },
+            {
+              "value2": "LOW",
+              "output": 2
+            }
+          ]
+        },
+        "fallbackOutput": 2
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-020",
+      "name": "Slack — HIGH Priority Alert",
+      "type": "n8n-nodes-base.slack",
+      "position": [
+        3560,
+        120
+      ],
+      "parameters": {
+        "operation": "post",
+        "channel": "={{ $env.SLACK_SIGNALS_CHANNEL || '#agent-x-signals' }}",
+        "text": "={{ `${$json.priority_emoji} *${$json.signal_priority} Signal — ${$json.company_name}*\\n*Type:* ${$json.signal_type.replace(/_/g,' ')}  |  *Source:* ${$json.source}\\n*Evidence:* ${$json.evidence}\\n*Best Lead Tier:* ${$json.best_lead_tier || 'Unknown'}  |  *Priority:* ${$json.signal_priority}\\n*Signal ID:* ${$items('Insert Signal Record')[0].json.signal_id}` }}",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "slack-main",
+          "name": "AZOX Slack"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-021",
+      "name": "Trigger Agent Re-evaluation",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        3800,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_BASE_URL }}/webhook/crm-sync",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Internal-Token",
+              "value": "={{ $env.INTERNAL_WEBHOOK_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({\n  event:      'company.signal.detected',\n  lead_id:    $json.best_lead_id,\n  signal_type: $json.signal_type,\n  evidence:   $json.evidence,\n  company_id: $json.company_id\n}) }}",
+        "options": {
+          "timeout": 5000,
+          "ignoreResponseCode": true
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-022",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3560,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO activities (type, lead_id, payload, created_at)\nVALUES ('signal_detected', $1, $2::jsonb, NOW());",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.best_lead_id || null,\n  JSON.stringify({\n    workflow:    'WF-10',\n    company_id:  $json.company_id,\n    signal_type: $json.signal_type,\n    source:      $json.source,\n    evidence:    $json.evidence,\n    signal_id:   $items('Insert Signal Record')[0].json.signal_id,\n    execution_id: $execution.id\n  })\n] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AZOX PostgreSQL"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-023",
+      "name": "Release Run Lock",
+      "type": "n8n-nodes-base.redis",
+      "position": [
+        4040,
+        300
+      ],
+      "parameters": {
+        "operation": "delete",
+        "key": "lock:wf10:signal_monitor"
+      },
+      "credentials": {
+        "redis": {
+          "id": "redis-main",
+          "name": "AZOX Redis"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-024",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.function",
+      "position": [
+        440,
+        480
+      ],
+      "parameters": {
+        "functionCode": "const err = $input.first().error || {};\nconst msg = err.message || 'Unknown error in WF-10';\n\n// Release the run lock on error so next cycle can proceed\ntry {\n  await $helpers.redis.del('lock:wf10:signal_monitor');\n} catch(_) {}\n\nreturn [{\n  json: {\n    status:       msg.includes('WF10_LOCK_HELD') ? 'lock_held' : 'error',\n    message:      msg,\n    workflow:     'WF-10',\n    timestamp:    new Date().toISOString(),\n    execution_id: $execution.id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-025",
+      "name": "Rate-Limit Delay",
+      "type": "n8n-nodes-base.wait",
+      "position": [
+        1640,
+        160
+      ],
+      "parameters": {
+        "resume": "timeInterval",
+        "unit": "milliseconds",
+        "value": 500
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "wf10-node-026",
+      "name": "Slack — MEDIUM Priority Alert",
+      "type": "n8n-nodes-base.slack",
+      "position": [
+        3560,
+        240
+      ],
+      "parameters": {
+        "operation": "post",
+        "channel": "={{ $env.SLACK_SIGNALS_CHANNEL || '#agent-x-signals' }}",
+        "text": "={{ `${$json.priority_emoji} *${$json.signal_priority} Signal — ${$json.company_name}*\\n*Type:* ${$json.signal_type.replace(/_/g,' ')}  |  *Source:* ${$json.source}\\n*Evidence:* ${$json.evidence}\\n*Best Lead Tier:* ${$json.best_lead_tier || 'Unknown'}  |  *Priority:* ${$json.signal_priority}  _(monitoring only — no auto action)_\\n*Signal ID:* ${$items('Insert Signal Record')[0].json.signal_id}` }}",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "slack-main",
+          "name": "AZOX Slack"
+        }
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Cron — Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Acquire Run Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Acquire Run Lock": {
+      "main": [
+        [
+          {
+            "node": "Fetch Active Companies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Active Companies": {
+      "main": [
+        [
+          {
+            "node": "Any Companies?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Companies?": {
+      "main": [
+        [
+          {
+            "node": "Check Signal Dedup Key",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release Lock — No Companies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Signal Dedup Key": {
+      "main": [
+        [
+          {
+            "node": "Already Checked Recently?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already Checked Recently?": {
+      "main": [
+        [
+          {
+            "node": "Set Signal Dedup Key",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip — Checked Recently",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Signal Dedup Key": {
+      "main": [
+        [
+          {
+            "node": "Rate-Limit Delay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apollo — Org Enrichment": {
+      "main": [
+        [
+          {
+            "node": "Detect Signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crunchbase — Funding Data": {
+      "main": [
+        [
+          {
+            "node": "Detect Signals",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Jina — Website Scrape": {
+      "main": [
+        [
+          {
+            "node": "Detect Signals",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "BuiltWith — Tech Stack": {
+      "main": [
+        [
+          {
+            "node": "Detect Signals",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Detect Signals": {
+      "main": [
+        [
+          {
+            "node": "Update Company Baseline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Company Baseline": {
+      "main": [
+        [
+          {
+            "node": "Signal Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signal Found?": {
+      "main": [
+        [
+          {
+            "node": "Insert Signal Record",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release Run Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Signal Record": {
+      "main": [
+        [
+          {
+            "node": "Emit company.signal.detected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Emit company.signal.detected": {
+      "main": [
+        [
+          {
+            "node": "Route by Signal Priority",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger Agent Re-evaluation": {
+      "main": [
+        [
+          {
+            "node": "Log Activity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Activity": {
+      "main": [
+        [
+          {
+            "node": "Release Run Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate-Limit Delay": {
+      "main": [
+        [
+          {
+            "node": "Apollo — Org Enrichment",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Crunchbase — Funding Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Jina — Website Scrape",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "BuiltWith — Tech Stack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Signal Priority": {
+      "main": [
+        [
+          {
+            "node": "Slack — HIGH Priority Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack — MEDIUM Priority Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Activity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack — HIGH Priority Alert": {
+      "main": [
+        [
+          {
+            "node": "Trigger Agent Re-evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack — MEDIUM Priority Alert": {
+      "main": [
+        [
+          {
+            "node": "Log Activity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "tags": [
+    "azox",
+    "agent-x",
+    "signal-monitor",
+    "v2"
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "version": "2.0.0",
+    "changelog": "v2: (1) API rate protection — LIMIT 50 + 500ms stagger delay before API fan-out; (2) Signal prioritization — HIGH/MEDIUM/LOW routing with separate Slack lanes"
+  }
+}
